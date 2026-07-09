@@ -1,0 +1,16 @@
+[Unit]
+Description=AIS RTL-TCP receiver on antenna-selected RTL-SDR dongle
+Documentation=man:rtl_tcp(1)
+Wants=dump1090-fa.service network.target
+Requires=rtl-antenna-picker.service
+After=rtl-antenna-picker.service dump1090-fa.service network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/run/rtl-antenna-picker.env
+ExecStart=/bin/sh -eu -c 'exec /usr/bin/rtl_tcp -d "$${AIS_RTL_INDEX:?missing AIS_RTL_INDEX}" -a 0.0.0.0 -p 10101'
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

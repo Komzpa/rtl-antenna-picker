@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rtl-antenna-picker"
+version = "0.1.0"
+description = "Select RTL-SDR roles by RF antenna fingerprint when serials are unreliable."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Komzpa" }]
+keywords = ["rtl-sdr", "ads-b", "ais", "piaware", "dump1090", "rtl_power"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: System Administrators",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Hardware",
+]
+dependencies = []
+
+[project.scripts]
+rtl-antenna-picker = "rtl_antenna_picker:main"
+
+[tool.setuptools]
+py-modules = ["rtl_antenna_picker"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
