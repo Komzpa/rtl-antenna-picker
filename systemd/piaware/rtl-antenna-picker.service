@@ -1,13 +1,13 @@
 [Unit]
 Description=RTL-SDR antenna-characteristics selector for ADS-B/AIS roles
-Documentation=file:/usr/local/sbin/rtl-antenna-picker
+Documentation=https://github.com/Komzpa/rtl-antenna-picker
 Wants=systemd-udev-settle.service
 After=local-fs.target systemd-udev-settle.service
 Before=dump1090-fa.service ais-rtl-tcp.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/rtl-antenna-picker --output-env /run/rtl-antenna-picker.env --state-dir /var/lib/rtl-antenna-picker --apply-piaware --print-json
+ExecStart=@RTL_ANTENNA_PICKER@ --output-env /run/rtl-antenna-picker.env --state-dir /var/lib/rtl-antenna-picker --apply-piaware --print-json
 RemainAfterExit=yes
 
 [Install]

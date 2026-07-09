@@ -1,53 +1,53 @@
 # PiAware + AIS systemd setup
 
-This example wires `rtl-antenna-picker` into a host that runs:
+This optional integration wires `rtl-antenna-picker` into a host that runs:
 
 - `dump1090-fa` for ADS-B;
-- `rtl_tcp` for the AIS/VHF dongle;
+- `rtl_tcp` for an AIS/VHF dongle;
 - an AIS consumer such as AIS-catcher or Shipfeeder connecting to RTLTCP.
 
-## Install files
+The same CLI can be used without PiAware. This page is only for the PiAware/AIS service-ordering pattern.
 
-From a checkout of this repository:
+## Install package and templates
+
+Install the package system-wide or with `pipx` so the `rtl-antenna-picker` executable path is durable:
 
 ```sh
-sudo install -m 0755 rtl_antenna_picker.py /usr/local/sbin/rtl-antenna-picker
-sudo install -d /var/lib/rtl-antenna-picker
-
-sudo install -m 0644 systemd/piaware/rtl-antenna-picker.service \
-  /etc/systemd/system/rtl-antenna-picker.service
-
-sudo install -d /etc/systemd/system/dump1090-fa.service.d
-sudo install -m 0644 systemd/piaware/dump1090-fa.service.d/10-rtl-antenna-picker.conf \
-  /etc/systemd/system/dump1090-fa.service.d/10-rtl-antenna-picker.conf
+pipx install git+https://github.com/Komzpa/rtl-antenna-picker.git
 ```
 
-If you do not already have an AIS RTLTCP service, install the complete example:
+Then install the systemd templates from the built package:
 
 ```sh
-sudo install -m 0644 systemd/piaware/ais-rtl-tcp.service \
-  /etc/systemd/system/ais-rtl-tcp.service
+sudo "$(command -v rtl-antenna-picker-install-piaware-ais-systemd)"
 ```
 
-If you already have an `ais-rtl-tcp.service`, install only the drop-in:
+The installer:
+
+- installs `rtl-antenna-picker.service`;
+- installs a `dump1090-fa` ordering drop-in;
+- installs a complete `ais-rtl-tcp.service` if one does not already exist;
+- otherwise installs an `ais-rtl-tcp.service` drop-in;
+- substitutes the actual `rtl-antenna-picker` executable path into the unit file;
+- runs `systemctl daemon-reload` and enables `rtl-antenna-picker.service`.
+
+## Manual install from a checkout
+
+From a source checkout you can use the shell helper:
 
 ```sh
-sudo install -d /etc/systemd/system/ais-rtl-tcp.service.d
-sudo install -m 0644 systemd/piaware/ais-rtl-tcp.service.d/10-rtl-antenna-picker.conf \
-  /etc/systemd/system/ais-rtl-tcp.service.d/10-rtl-antenna-picker.conf
+sudo scripts/install-piaware-ais-systemd.sh
 ```
 
-Then reload and enable:
+Or install by hand. When copying `systemd/piaware/rtl-antenna-picker.service`, replace `@RTL_ANTENNA_PICKER@` with the absolute path from:
 
 ```sh
-sudo systemctl daemon-reload
-sudo systemctl enable rtl-antenna-picker.service
-sudo systemctl enable ais-rtl-tcp.service
+command -v rtl-antenna-picker
 ```
 
 ## First live cutover
 
-Do this in a maintenance window. Measurement requires both RTL-SDRs to be free.
+Do this in a maintenance window. Measurement requires all relevant RTL-SDRs to be free.
 
 ```sh
 sudo systemctl stop ais-rtl-tcp.service
@@ -60,7 +60,7 @@ sudo systemctl start dump1090-fa.service
 sudo systemctl start ais-rtl-tcp.service
 ```
 
-If the AIS consumer was connected to the old `rtl_tcp`, restart it if it does not reconnect by itself.
+If the AIS consumer was connected to the old `rtl_tcp`, restart that consumer if it does not reconnect by itself.
 
 ## Verify
 
@@ -73,7 +73,7 @@ piaware-status
 ss -ltnp | grep ':10101'
 ```
 
-Expected shape:
+Expected shape for the default AIS/ADS-B profile:
 
 ```sh
 AIS_RTL_INDEX=1
@@ -82,6 +82,16 @@ RTL_AIS_MEDIAN_DELTA_DB=10.660
 ```
 
 The exact indexes and dB values depend on your hardware and RF environment.
+
+## Custom role profile in systemd
+
+If your station needs different bands, edit `rtl-antenna-picker.service` after installation and replace the default command with explicit roles, for example:
+
+```ini
+ExecStart=/usr/local/bin/rtl-antenna-picker --role vhf=156M:163M:5k --role uhf=430M:440M:10k --min-role-delta vhf=6 --output-env /run/rtl-antenna-picker.env --state-dir /var/lib/rtl-antenna-picker --print-json
+```
+
+Or use a JSON config file and pass `--config /etc/rtl-antenna-picker/station.json`.
 
 ## Rollback
 

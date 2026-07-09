@@ -1,29 +1,30 @@
 #!/usr/bin/env python3
-"""Choose RTL-SDR roles from RF antenna fingerprints.
+"""Choose RTL-SDR receiver roles from RF antenna fingerprints.
 
-This is intended for the balcony PiAware host where two RTL-SDR dongles are
-connected to different antennas but may not have trustworthy unique selectors.
-It measures each free dongle in the AIS/VHF and ADS-B bands, picks the dongle
-with the strongest AIS-band median as the AIS receiver, and uses the other
-strongest ADS-B candidate for dump1090-fa.
+The tool measures each free RTL-SDR with ``rtl_power`` over one or more named
+role bands, then assigns distinct runtime device indexes to those roles. It is
+useful when serials, EEPROM labels, or kernel enumeration order are unreliable
+but the antennas themselves have distinguishable RF fingerprints.
 """
 from __future__ import annotations
 
 import argparse
 import csv
+import itertools
 import json
 import math
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import statistics
 import subprocess
 import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
-from typing import Iterable, Sequence
+from typing import Sequence
 
 DEFAULT_AIS_BAND = "156M:163M:5k"
 DEFAULT_ADSB_BAND = "1088M:1092M:5k"
@@ -31,6 +32,10 @@ DEFAULT_GAIN = "33.8"
 DEFAULT_INTEGRATION = "1"
 DEFAULT_DURATION = "3s"
 DEFAULT_MIN_AIS_MEDIAN_DELTA_DB = 6.0
+SCORE_STATS = ("median", "p95", "peak")
+ASSIGNMENT_STRATEGIES = ("priority", "maximize-total")
+ROLE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
+ENV_SAFE_RE = re.compile(r"[^A-Za-z0-9]")
 
 
 @dataclass(frozen=True)
@@ -43,19 +48,39 @@ class BandSummary:
 
 
 @dataclass(frozen=True)
+class RoleSpec:
+    name: str
+    band: str
+    min_delta_db: float | None = None
+
+
+@dataclass(frozen=True)
 class DeviceMetrics:
     index: int
-    ais: BandSummary
-    adsb: BandSummary
+    role_summaries: dict[str, BandSummary]
 
 
 @dataclass(frozen=True)
 class Selection:
-    ais_index: int
-    adsb_index: int
-    ais_median_delta_db: float
-    ais_peak_delta_db: float
+    assignments: dict[str, int]
+    role_deltas_db: dict[str, float]
     metrics: list[DeviceMetrics]
+    roles: list[RoleSpec]
+    score_stat: str
+    assignment_strategy: str
+
+    def index_for(self, role_name: str) -> int:
+        return self.assignments[normalize_role_name(role_name)]
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    roles: list[RoleSpec]
+    score_stat: str
+    assignment_strategy: str
+    gain: str
+    integration: str
+    duration: str
 
 
 def parse_rtl_power_csv(path: Path) -> BandSummary:
@@ -101,7 +126,7 @@ def parse_rtl_power_csv(path: Path) -> BandSummary:
 
 
 def parse_rtl_test_device_count(output: str) -> int | None:
-    match = re.search(r"Found\s+(\d+)\s+device", output)
+    match = re.search(r"found\s+(\d+)\s+device", output, flags=re.IGNORECASE)
     if not match:
         return None
     return int(match.group(1))
@@ -120,6 +145,141 @@ def detect_device_count(rtl_test: str, timeout_seconds: float) -> int:
     if count is None:
         raise RuntimeError(f"could not parse RTL device count from {rtl_test} -t output:\n{output}")
     return count
+
+
+def normalize_role_name(raw: str) -> str:
+    name = raw.strip().lower()
+    if not ROLE_NAME_RE.match(name):
+        raise ValueError(
+            f"invalid role name {raw!r}; use letters, digits, underscore, dot, or dash, and start with a letter"
+        )
+    return name
+
+
+def role_env_name(role_name: str) -> str:
+    return ENV_SAFE_RE.sub("_", normalize_role_name(role_name)).upper()
+
+
+def parse_role_arg(raw: str) -> RoleSpec:
+    if "=" not in raw:
+        raise argparse.ArgumentTypeError("role must be NAME=BAND, for example ais=156M:163M:5k")
+    name, band = raw.split("=", 1)
+    name = normalize_role_name(name)
+    band = band.strip()
+    if not band:
+        raise argparse.ArgumentTypeError(f"role {name!r} has an empty band")
+    return RoleSpec(name=name, band=band)
+
+
+def parse_role_delta_arg(raw: str) -> tuple[str, float]:
+    if "=" not in raw:
+        raise argparse.ArgumentTypeError("role delta must be NAME=DB, for example ais=6")
+    name, value = raw.split("=", 1)
+    try:
+        delta = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid dB delta {value!r}") from exc
+    if not math.isfinite(delta) or delta < 0:
+        raise argparse.ArgumentTypeError("role delta must be a finite non-negative number")
+    return normalize_role_name(name), delta
+
+
+def load_json_config(path: Path | None) -> dict[str, object]:
+    if path is None:
+        return {}
+    with path.open() as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError("config JSON must be an object")
+    return payload
+
+
+def roles_from_config(payload: dict[str, object]) -> list[RoleSpec]:
+    raw_roles = payload.get("roles", [])
+    if not isinstance(raw_roles, list):
+        raise ValueError("config field 'roles' must be a list")
+    roles: list[RoleSpec] = []
+    for item in raw_roles:
+        if not isinstance(item, dict):
+            raise ValueError("each config role must be an object")
+        if "name" not in item or "band" not in item:
+            raise ValueError("each config role needs 'name' and 'band'")
+        min_delta = item.get("min_delta_db")
+        if min_delta is not None:
+            min_delta = float(min_delta)
+            if not math.isfinite(min_delta) or min_delta < 0:
+                raise ValueError("config min_delta_db must be a finite non-negative number")
+        roles.append(RoleSpec(normalize_role_name(str(item["name"])), str(item["band"]), min_delta))
+    return roles
+
+
+def merge_roles(base_roles: Sequence[RoleSpec], overrides: dict[str, float]) -> list[RoleSpec]:
+    seen_env_names: dict[str, str] = {}
+    merged: list[RoleSpec] = []
+    for role in base_roles:
+        min_delta = overrides.get(role.name, role.min_delta_db)
+        env_name = role_env_name(role.name)
+        if env_name in seen_env_names and seen_env_names[env_name] != role.name:
+            raise ValueError(f"role names {seen_env_names[env_name]!r} and {role.name!r} map to the same env name {env_name}")
+        seen_env_names[env_name] = role.name
+        if any(existing.name == role.name for existing in merged):
+            raise ValueError(f"duplicate role name {role.name!r}")
+        merged.append(RoleSpec(role.name, role.band, min_delta))
+    if not merged:
+        raise ValueError("at least one role is required")
+    return merged
+
+
+def build_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
+    config = load_json_config(args.config)
+    config_roles = roles_from_config(config)
+    cli_roles = list(args.role or [])
+
+    if config_roles or cli_roles:
+        role_by_name: dict[str, RoleSpec] = {role.name: role for role in config_roles}
+        order = [role.name for role in config_roles]
+        for role in cli_roles:
+            if role.name not in role_by_name:
+                order.append(role.name)
+            role_by_name[role.name] = role
+        roles = [role_by_name[name] for name in order]
+    else:
+        roles = [
+            RoleSpec("ais", args.ais_band, args.min_ais_median_delta_db),
+            RoleSpec("adsb", args.adsb_band, None),
+        ]
+
+    delta_overrides = dict(args.min_role_delta or [])
+    # Backward compatibility: if a user keeps an 'ais' role, preserve the old
+    # conservative default unless config/CLI already supplied a role-specific value.
+    if "ais" not in delta_overrides and any(role.name == "ais" and role.min_delta_db is None for role in roles):
+        delta_overrides["ais"] = args.min_ais_median_delta_db
+
+    roles = merge_roles(roles, delta_overrides)
+    score_stat = str(config.get("score_stat", args.score_stat))
+    if score_stat not in SCORE_STATS:
+        raise ValueError(f"score_stat must be one of {', '.join(SCORE_STATS)}")
+    assignment_strategy = str(config.get("assignment_strategy", args.assignment_strategy))
+    if assignment_strategy not in ASSIGNMENT_STRATEGIES:
+        raise ValueError(f"assignment_strategy must be one of {', '.join(ASSIGNMENT_STRATEGIES)}")
+    return RuntimeConfig(
+        roles=roles,
+        score_stat=score_stat,
+        assignment_strategy=assignment_strategy,
+        gain=args.gain,
+        integration=args.integration,
+        duration=args.duration,
+    )
+
+
+def band_score(summary: BandSummary, stat: str) -> float:
+    if stat == "median":
+        return summary.median_db
+    if stat == "p95":
+        return summary.p95_db
+    if stat == "peak":
+        return summary.peak_db
+    raise ValueError(f"unsupported score stat {stat!r}")
 
 
 def run_rtl_power(
@@ -160,9 +320,8 @@ def run_rtl_power(
 def collect_metrics(
     *,
     rtl_power: str,
-    device_count: int,
-    ais_band: str,
-    adsb_band: str,
+    device_indexes: Sequence[int],
+    roles: Sequence[RoleSpec],
     gain: str,
     integration: str,
     duration: str,
@@ -170,89 +329,132 @@ def collect_metrics(
     work_dir: Path,
 ) -> list[DeviceMetrics]:
     metrics: list[DeviceMetrics] = []
-    for index in range(device_count):
-        ais_path = work_dir / f"device{index}-ais.csv"
-        adsb_path = work_dir / f"device{index}-adsb.csv"
-        run_rtl_power(
-            rtl_power=rtl_power,
-            device_index=index,
-            band=ais_band,
-            gain=gain,
-            integration=integration,
-            duration=duration,
-            timeout_seconds=timeout_seconds,
-            output_path=ais_path,
-        )
-        run_rtl_power(
-            rtl_power=rtl_power,
-            device_index=index,
-            band=adsb_band,
-            gain=gain,
-            integration=integration,
-            duration=duration,
-            timeout_seconds=timeout_seconds,
-            output_path=adsb_path,
-        )
-        metrics.append(
-            DeviceMetrics(
-                index=index,
-                ais=parse_rtl_power_csv(ais_path),
-                adsb=parse_rtl_power_csv(adsb_path),
+    for index in device_indexes:
+        role_summaries: dict[str, BandSummary] = {}
+        for role in roles:
+            output_path = work_dir / f"device{index}-{role_env_name(role.name).lower()}.csv"
+            run_rtl_power(
+                rtl_power=rtl_power,
+                device_index=index,
+                band=role.band,
+                gain=gain,
+                integration=integration,
+                duration=duration,
+                timeout_seconds=timeout_seconds,
+                output_path=output_path,
             )
-        )
+            role_summaries[role.name] = parse_rtl_power_csv(output_path)
+        metrics.append(DeviceMetrics(index=index, role_summaries=role_summaries))
     return metrics
 
 
-def choose_selection(metrics: Sequence[DeviceMetrics], min_ais_median_delta_db: float) -> Selection:
-    if len(metrics) < 2:
-        raise ValueError(f"need at least two RTL devices, found {len(metrics)}")
+def choose_selection(
+    metrics: Sequence[DeviceMetrics],
+    roles: Sequence[RoleSpec],
+    score_stat: str = "median",
+    assignment_strategy: str = "priority",
+) -> Selection:
+    if not roles:
+        raise ValueError("at least one role is required")
+    if len(metrics) < len(roles):
+        raise ValueError(f"need at least {len(roles)} RTL devices for {len(roles)} roles, found {len(metrics)}")
+    if score_stat not in SCORE_STATS:
+        raise ValueError(f"score_stat must be one of {', '.join(SCORE_STATS)}")
+    if assignment_strategy not in ASSIGNMENT_STRATEGIES:
+        raise ValueError(f"assignment_strategy must be one of {', '.join(ASSIGNMENT_STRATEGIES)}")
 
-    by_ais = sorted(metrics, key=lambda metric: metric.ais.median_db, reverse=True)
-    ais = by_ais[0]
-    runner_up = by_ais[1]
-    median_delta = ais.ais.median_db - runner_up.ais.median_db
-    peak_delta = ais.ais.peak_db - runner_up.ais.peak_db
-    if median_delta < min_ais_median_delta_db:
-        raise ValueError(
-            "AIS antenna fingerprint is not decisive: "
-            f"top device {ais.index} median {ais.ais.median_db:.1f} dB, "
-            f"runner-up device {runner_up.index} median {runner_up.ais.median_db:.1f} dB, "
-            f"delta {median_delta:.1f} dB < required {min_ais_median_delta_db:.1f} dB"
-        )
+    metrics_by_index = {metric.index: metric for metric in metrics}
+    if len(metrics_by_index) != len(metrics):
+        raise ValueError("duplicate device indexes in metrics")
 
-    remaining = [metric for metric in metrics if metric.index != ais.index]
-    adsb = max(remaining, key=lambda metric: metric.adsb.median_db)
+    device_indexes = [metric.index for metric in metrics]
+    for role in roles:
+        for metric in metrics:
+            if role.name not in metric.role_summaries:
+                raise ValueError(f"missing metrics for role {role.name!r} on device {metric.index}")
+
+    if assignment_strategy == "priority":
+        remaining = set(device_indexes)
+        best_assignment = {}
+        for role in roles:
+            selected_index = max(
+                remaining,
+                key=lambda index: (band_score(metrics_by_index[index].role_summaries[role.name], score_stat), -index),
+            )
+            best_assignment[role.name] = selected_index
+            remaining.remove(selected_index)
+    else:
+        best_assignment: dict[str, int] | None = None
+        best_score: float | None = None
+        for candidate_indexes in itertools.permutations(device_indexes, len(roles)):
+            score = 0.0
+            for role, index in zip(roles, candidate_indexes, strict=True):
+                score += band_score(metrics_by_index[index].role_summaries[role.name], score_stat)
+            assignment = {role.name: index for role, index in zip(roles, candidate_indexes, strict=True)}
+            tie_break = tuple(candidate_indexes)
+            best_tie_break = tuple(best_assignment[role.name] for role in roles) if best_assignment else ()
+            if best_score is None or score > best_score or (score == best_score and tie_break < best_tie_break):
+                best_score = score
+                best_assignment = assignment
+        if best_assignment is None:
+            raise ValueError("could not assign roles to devices")
+
+    deltas: dict[str, float] = {}
+    for role in roles:
+        selected_index = best_assignment[role.name]
+        selected_score = band_score(metrics_by_index[selected_index].role_summaries[role.name], score_stat)
+        runner_up_scores = [
+            band_score(metric.role_summaries[role.name], score_stat)
+            for metric in metrics
+            if metric.index != selected_index
+        ]
+        delta = math.inf if not runner_up_scores else selected_score - max(runner_up_scores)
+        deltas[role.name] = delta
+        if role.min_delta_db is not None and delta < role.min_delta_db:
+            raise ValueError(
+                f"{role.name} antenna fingerprint is not decisive: "
+                f"selected device {selected_index} {score_stat} {selected_score:.1f} dB, "
+                f"delta {delta:.1f} dB < required {role.min_delta_db:.1f} dB"
+            )
+
     return Selection(
-        ais_index=ais.index,
-        adsb_index=adsb.index,
-        ais_median_delta_db=median_delta,
-        ais_peak_delta_db=peak_delta,
+        assignments=best_assignment,
+        role_deltas_db=deltas,
         metrics=list(metrics),
+        roles=list(roles),
+        score_stat=score_stat,
+        assignment_strategy=assignment_strategy,
     )
 
 
 def shell_env_lines(selection: Selection, timestamp: str) -> list[str]:
+    role_names = [role.name for role in selection.roles]
     lines = [
         f"RTL_ANTENNA_PICKER_TIMESTAMP={shlex.quote(timestamp)}",
-        f"AIS_RTL_INDEX={selection.ais_index}",
-        f"ADSB_RTL_INDEX={selection.adsb_index}",
-        f"RTL_AIS_MEDIAN_DELTA_DB={selection.ais_median_delta_db:.3f}",
-        f"RTL_AIS_PEAK_DELTA_DB={selection.ais_peak_delta_db:.3f}",
+        f"RTL_ANTENNA_PICKER_SCORE_STAT={selection.score_stat}",
+        f"RTL_ANTENNA_PICKER_ASSIGNMENT_STRATEGY={selection.assignment_strategy}",
+        f"RTL_ANTENNA_PICKER_ROLES={shlex.quote(' '.join(role_names))}",
     ]
+
+    for role in selection.roles:
+        env_role = role_env_name(role.name)
+        lines.append(f"{env_role}_RTL_INDEX={selection.assignments[role.name]}")
+        delta = selection.role_deltas_db[role.name]
+        delta_value = "inf" if math.isinf(delta) else f"{delta:.3f}"
+        lines.append(f"RTL_{env_role}_{selection.score_stat.upper()}_DELTA_DB={delta_value}")
+
     for metric in selection.metrics:
-        prefix = f"RTL_DEVICE_{metric.index}"
-        lines.extend(
-            [
-                f"{prefix}_AIS_MEDIAN_DB={metric.ais.median_db:.3f}",
-                f"{prefix}_AIS_P95_DB={metric.ais.p95_db:.3f}",
-                f"{prefix}_AIS_PEAK_DB={metric.ais.peak_db:.3f}",
-                f"{prefix}_AIS_PEAK_HZ={metric.ais.peak_hz:.1f}" if metric.ais.peak_hz is not None else f"{prefix}_AIS_PEAK_HZ=",
-                f"{prefix}_ADSB_MEDIAN_DB={metric.adsb.median_db:.3f}",
-                f"{prefix}_ADSB_P95_DB={metric.adsb.p95_db:.3f}",
-                f"{prefix}_ADSB_PEAK_DB={metric.adsb.peak_db:.3f}",
-                f"{prefix}_ADSB_PEAK_HZ={metric.adsb.peak_hz:.1f}" if metric.adsb.peak_hz is not None else f"{prefix}_ADSB_PEAK_HZ=",
-            ]
-        )
+        for role in selection.roles:
+            summary = metric.role_summaries[role.name]
+            prefix = f"RTL_DEVICE_{metric.index}_{role_env_name(role.name)}"
+            lines.extend(
+                [
+                    f"{prefix}_MEDIAN_DB={summary.median_db:.3f}",
+                    f"{prefix}_P95_DB={summary.p95_db:.3f}",
+                    f"{prefix}_PEAK_DB={summary.peak_db:.3f}",
+                    f"{prefix}_PEAK_HZ={summary.peak_hz:.1f}" if summary.peak_hz is not None else f"{prefix}_PEAK_HZ=",
+                ]
+            )
     return lines
 
 
@@ -272,39 +474,162 @@ def write_text_atomic(path: Path, text: str, mode: int = 0o644) -> None:
         raise
 
 
-def selection_payload(selection: Selection, timestamp: str, args: argparse.Namespace) -> dict[str, object]:
+def selection_payload(selection: Selection, timestamp: str, runtime: RuntimeConfig) -> dict[str, object]:
+    selected_roles = {
+        role.name: {
+            "index": selection.assignments[role.name],
+            f"{selection.score_stat}_delta_db": selection.role_deltas_db[role.name],
+        }
+        for role in selection.roles
+    }
+    selected: dict[str, object] = {
+        "roles": selected_roles,
+        "score_stat": selection.score_stat,
+        "assignment_strategy": selection.assignment_strategy,
+    }
+    # Compatibility for older consumers and simple jq one-liners.
+    for role_name in ("ais", "adsb"):
+        if role_name in selection.assignments:
+            selected[f"{role_name}_index"] = selection.assignments[role_name]
+            selected[f"{role_name}_{selection.score_stat}_delta_db"] = selection.role_deltas_db[role_name]
+
     return {
         "timestamp": timestamp,
-        "selected": {
-            "ais_index": selection.ais_index,
-            "adsb_index": selection.adsb_index,
-            "ais_median_delta_db": selection.ais_median_delta_db,
-            "ais_peak_delta_db": selection.ais_peak_delta_db,
-        },
-        "bands": {"ais": args.ais_band, "adsb": args.adsb_band},
-        "rtl_power": {"gain": args.gain, "integration": args.integration, "duration": args.duration},
-        "metrics": [asdict(metric) for metric in selection.metrics],
+        "selected": selected,
+        "bands": {role.name: role.band for role in selection.roles},
+        "rtl_power": {"gain": runtime.gain, "integration": runtime.integration, "duration": runtime.duration},
+        "metrics": [
+            {
+                "index": metric.index,
+                "roles": {role.name: asdict(metric.role_summaries[role.name]) for role in selection.roles},
+            }
+            for metric in selection.metrics
+        ],
     }
 
 
-def apply_piaware_index(piaware_config: str, adsb_index: int) -> None:
+def apply_piaware_index(piaware_config: str, role_name: str, selection: Selection) -> None:
+    role_name = normalize_role_name(role_name)
+    if role_name not in selection.assignments:
+        raise RuntimeError(f"cannot apply PiAware index: role {role_name!r} is not selected")
+    index = selection.assignments[role_name]
     result = subprocess.run(
-        [piaware_config, "rtlsdr-device-index", str(adsb_index)],
+        [piaware_config, "rtlsdr-device-index", str(index)],
         check=False,
         text=True,
         capture_output=True,
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"{piaware_config} rtlsdr-device-index {adsb_index} failed rc={result.returncode}\n"
+            f"{piaware_config} rtlsdr-device-index {index} failed rc={result.returncode}\n"
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         )
 
 
+
+def find_systemd_template_root() -> Path:
+    """Return the PiAware/AIS systemd template directory.
+
+    Source checkouts keep templates under ``systemd/piaware``. Built wheels
+    install the same files under ``share/rtl-antenna-picker/systemd/piaware``.
+    """
+    candidates = [
+        Path(__file__).resolve().parent / "systemd" / "piaware",
+        Path(sys.prefix) / "share" / "rtl-antenna-picker" / "systemd" / "piaware",
+    ]
+    for candidate in candidates:
+        if (candidate / "rtl-antenna-picker.service").exists():
+            return candidate
+    searched = ", ".join(str(candidate) for candidate in candidates)
+    raise FileNotFoundError(f"could not find systemd templates; searched {searched}")
+
+
+def render_template(path: Path, replacements: dict[str, str]) -> str:
+    text = path.read_text()
+    for key, value in replacements.items():
+        text = text.replace(key, value)
+    unresolved = sorted(set(re.findall(r"@[A-Z0-9_]+@", text)))
+    if unresolved:
+        raise ValueError(f"unresolved template placeholders in {path}: {', '.join(unresolved)}")
+    return text
+
+
+def install_rendered_file(source: Path, destination: Path, replacements: dict[str, str], mode: int = 0o644) -> None:
+    write_text_atomic(destination, render_template(source, replacements), mode=mode)
+
+
+def install_piaware_ais_systemd_main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Install PiAware/AIS systemd templates for rtl-antenna-picker.")
+    parser.add_argument("--systemd-dir", type=Path, default=Path("/etc/systemd/system"))
+    parser.add_argument("--picker-bin", help="absolute rtl-antenna-picker path for systemd ExecStart")
+    parser.add_argument("--template-root", type=Path, help="override systemd template source directory")
+    parser.add_argument("--no-daemon-reload", action="store_true")
+    parser.add_argument("--no-enable", action="store_true")
+    parser.add_argument("--force-complete-ais-service", action="store_true", help="install the complete ais-rtl-tcp.service even if one already exists")
+    parser.add_argument("--dry-run", action="store_true")
+    args = parser.parse_args(argv)
+
+    if os.name == "posix" and hasattr(os, "geteuid") and os.geteuid() != 0 and not args.dry_run:
+        raise RuntimeError("installing systemd files requires root; rerun with sudo")
+
+    picker_bin = args.picker_bin or shutil.which("rtl-antenna-picker")
+    if not picker_bin:
+        raise RuntimeError("could not find rtl-antenna-picker in PATH; pass --picker-bin /absolute/path")
+    picker_path = Path(picker_bin)
+    if not picker_path.is_absolute():
+        raise RuntimeError(f"--picker-bin must be absolute, got {picker_bin!r}")
+
+    template_root = args.template_root or find_systemd_template_root()
+    replacements = {"@RTL_ANTENNA_PICKER@": str(picker_path)}
+    operations: list[tuple[Path, Path]] = [
+        (template_root / "rtl-antenna-picker.service", args.systemd_dir / "rtl-antenna-picker.service"),
+        (
+            template_root / "dump1090-fa.service.d" / "10-rtl-antenna-picker.conf",
+            args.systemd_dir / "dump1090-fa.service.d" / "10-rtl-antenna-picker.conf",
+        ),
+    ]
+
+    existing_ais_unit = (args.systemd_dir / "ais-rtl-tcp.service").exists() or Path("/lib/systemd/system/ais-rtl-tcp.service").exists()
+    if args.force_complete_ais_service or not existing_ais_unit:
+        operations.append((template_root / "ais-rtl-tcp.service", args.systemd_dir / "ais-rtl-tcp.service"))
+        enable_ais = True
+    else:
+        operations.append(
+            (
+                template_root / "ais-rtl-tcp.service.d" / "10-rtl-antenna-picker.conf",
+                args.systemd_dir / "ais-rtl-tcp.service.d" / "10-rtl-antenna-picker.conf",
+            )
+        )
+        enable_ais = False
+
+    for source, destination in operations:
+        if args.dry_run:
+            print(f"would install {source} -> {destination}")
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            install_rendered_file(source, destination, replacements)
+            print(f"installed {destination}")
+
+    if not args.dry_run and not args.no_daemon_reload:
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+    if not args.dry_run and not args.no_enable:
+        subprocess.run(["systemctl", "enable", "rtl-antenna-picker.service"], check=True)
+        if enable_ais:
+            subprocess.run(["systemctl", "enable", "ais-rtl-tcp.service"], check=True)
+
+    return 0
+
 def positive_float(raw: str) -> float:
     value = float(raw)
-    if value <= 0:
-        raise argparse.ArgumentTypeError("must be positive")
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return value
+
+
+def non_negative_int(raw: str) -> int:
+    value = int(raw)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
     return value
 
 
@@ -312,18 +637,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-env", type=Path, default=Path("/run/rtl-antenna-picker.env"))
     parser.add_argument("--state-dir", type=Path, default=Path("/var/lib/rtl-antenna-picker"))
+    parser.add_argument("--config", type=Path, help="JSON config with roles, for example {'roles':[{'name':'ais','band':'156M:163M:5k'}]}")
     parser.add_argument("--rtl-test", default="rtl_test")
     parser.add_argument("--rtl-power", default="rtl_power")
     parser.add_argument("--piaware-config", default="piaware-config")
     parser.add_argument("--device-count", type=int, help="override auto-detected RTL device count")
-    parser.add_argument("--ais-band", default=DEFAULT_AIS_BAND)
-    parser.add_argument("--adsb-band", default=DEFAULT_ADSB_BAND)
+    parser.add_argument("--device-index", type=non_negative_int, action="append", help="measure only this runtime device index; repeatable")
+    parser.add_argument("--role", type=parse_role_arg, action="append", metavar="NAME=BAND", help="role band to measure; repeatable, e.g. ais=156M:163M:5k")
+    parser.add_argument("--min-role-delta", type=parse_role_delta_arg, action="append", metavar="NAME=DB", help="require selected role to beat the next device by this dB delta")
+    parser.add_argument("--score-stat", choices=SCORE_STATS, default="median", help="band summary statistic used for assignment")
+    parser.add_argument("--assignment-strategy", choices=ASSIGNMENT_STRATEGIES, default="priority", help="role assignment strategy: priority assigns roles in CLI/config order; maximize-total optimizes total score")
+    parser.add_argument("--ais-band", default=DEFAULT_AIS_BAND, help="legacy/default AIS role band used when --role is absent")
+    parser.add_argument("--adsb-band", default=DEFAULT_ADSB_BAND, help="legacy/default ADS-B role band used when --role is absent")
     parser.add_argument("--gain", default=DEFAULT_GAIN)
     parser.add_argument("--integration", default=DEFAULT_INTEGRATION)
     parser.add_argument("--duration", default=DEFAULT_DURATION)
     parser.add_argument("--command-timeout", type=positive_float, default=20.0)
-    parser.add_argument("--min-ais-median-delta-db", type=float, default=DEFAULT_MIN_AIS_MEDIAN_DELTA_DB)
-    parser.add_argument("--apply-piaware", action="store_true", help="write PiAware rtlsdr-device-index to the selected ADS-B index")
+    parser.add_argument("--min-ais-median-delta-db", type=float, default=DEFAULT_MIN_AIS_MEDIAN_DELTA_DB, help="legacy shortcut for --min-role-delta ais=DB")
+    parser.add_argument("--apply-piaware", action="store_true", help="write PiAware rtlsdr-device-index to the selected --piaware-role index")
+    parser.add_argument("--piaware-role", default="adsb", help="selected role to apply to PiAware when --apply-piaware is used")
     parser.add_argument("--print-json", action="store_true")
     return parser
 
@@ -331,42 +663,50 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    runtime = build_runtime_config(args)
 
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    device_count = args.device_count or detect_device_count(args.rtl_test, args.command_timeout)
-    if device_count < 2:
-        raise RuntimeError(f"need at least two RTL devices, found {device_count}")
+    if args.device_index:
+        device_indexes = sorted(dict.fromkeys(args.device_index))
+    else:
+        device_count = args.device_count or detect_device_count(args.rtl_test, args.command_timeout)
+        if device_count < 1:
+            raise RuntimeError(f"need at least one RTL device, found {device_count}")
+        device_indexes = list(range(device_count))
+
+    if len(device_indexes) < len(runtime.roles):
+        raise RuntimeError(f"need at least {len(runtime.roles)} RTL devices for roles {', '.join(role.name for role in runtime.roles)}")
 
     args.state_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="rtl-antenna-picker-", dir=str(args.state_dir)) as tmp_dir:
         metrics = collect_metrics(
             rtl_power=args.rtl_power,
-            device_count=device_count,
-            ais_band=args.ais_band,
-            adsb_band=args.adsb_band,
-            gain=args.gain,
-            integration=args.integration,
-            duration=args.duration,
+            device_indexes=device_indexes,
+            roles=runtime.roles,
+            gain=runtime.gain,
+            integration=runtime.integration,
+            duration=runtime.duration,
             timeout_seconds=args.command_timeout,
             work_dir=Path(tmp_dir),
         )
 
-    selection = choose_selection(metrics, args.min_ais_median_delta_db)
-    payload = selection_payload(selection, timestamp, args)
+    selection = choose_selection(metrics, runtime.roles, runtime.score_stat, runtime.assignment_strategy)
+    payload = selection_payload(selection, timestamp, runtime)
 
     env_text = "\n".join(shell_env_lines(selection, timestamp)) + "\n"
     write_text_atomic(args.output_env, env_text)
     write_text_atomic(args.state_dir / "latest.json", json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
     if args.apply_piaware:
-        apply_piaware_index(args.piaware_config, selection.adsb_index)
+        apply_piaware_index(args.piaware_config, args.piaware_role, selection)
 
-    summary = (
-        f"selected AIS RTL index {selection.ais_index}, ADS-B RTL index {selection.adsb_index}; "
-        f"AIS median delta {selection.ais_median_delta_db:.1f} dB, "
-        f"AIS peak delta {selection.ais_peak_delta_db:.1f} dB"
+    assignments = ", ".join(f"{role.name} RTL index {selection.assignments[role.name]}" for role in runtime.roles)
+    deltas = ", ".join(
+        f"{role.name} {runtime.score_stat} delta {selection.role_deltas_db[role.name]:.1f} dB"
+        for role in runtime.roles
+        if not math.isinf(selection.role_deltas_db[role.name])
     )
-    print(summary, file=sys.stderr)
+    print(f"selected {assignments}; {deltas}", file=sys.stderr)
     if args.print_json:
         print(json.dumps(payload, indent=2, sort_keys=True))
     return 0

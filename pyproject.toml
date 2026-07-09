@@ -4,25 +4,44 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rtl-antenna-picker"
-version = "0.1.0"
+version = "0.2.0"
 description = "Select RTL-SDR roles by RF antenna fingerprint when serials are unreliable."
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
 authors = [{ name = "Komzpa" }]
-keywords = ["rtl-sdr", "ads-b", "ais", "piaware", "dump1090", "rtl_power"]
+keywords = ["rtl-sdr", "rf", "antenna", "ads-b", "ais", "piaware", "dump1090", "rtl_power"]
 classifiers = [
   "Environment :: Console",
   "Intended Audience :: System Administrators",
+  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
   "Topic :: System :: Hardware",
 ]
 dependencies = []
 
 [project.scripts]
 rtl-antenna-picker = "rtl_antenna_picker:main"
+rtl-antenna-picker-install-piaware-ais-systemd = "rtl_antenna_picker:install_piaware_ais_systemd_main"
 
 [tool.setuptools]
 py-modules = ["rtl_antenna_picker"]
+
+[tool.setuptools.data-files]
+"share/rtl-antenna-picker/systemd/piaware" = [
+  "systemd/piaware/README.md",
+  "systemd/piaware/ais-rtl-tcp.service",
+  "systemd/piaware/rtl-antenna-picker.service",
+]
+"share/rtl-antenna-picker/systemd/piaware/ais-rtl-tcp.service.d" = [
+  "systemd/piaware/ais-rtl-tcp.service.d/10-rtl-antenna-picker.conf",
+]
+"share/rtl-antenna-picker/systemd/piaware/dump1090-fa.service.d" = [
+  "systemd/piaware/dump1090-fa.service.d/10-rtl-antenna-picker.conf",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
