@@ -533,10 +533,9 @@ def find_systemd_template_root() -> Path:
     Source checkouts keep templates under ``systemd/piaware``. Built wheels
     install the same files under ``share/rtl-antenna-picker/systemd/piaware``.
     """
-    candidates = [
-        Path(__file__).resolve().parent / "systemd" / "piaware",
-        Path(sys.prefix) / "share" / "rtl-antenna-picker" / "systemd" / "piaware",
-    ]
+    module_dir = Path(__file__).resolve().parent
+    candidates = [base / "systemd" / "piaware" for base in (module_dir, *module_dir.parents)]
+    candidates.append(Path(sys.prefix) / "share" / "rtl-antenna-picker" / "systemd" / "piaware")
     for candidate in candidates:
         if (candidate / "rtl-antenna-picker.service").exists():
             return candidate
