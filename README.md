@@ -141,6 +141,21 @@ The repository includes optional systemd templates for a PiAware + AIS RTLTCP st
 - `systemd/piaware/dump1090-fa.service.d/10-rtl-antenna-picker.conf`
 - `systemd/piaware/ais-rtl-tcp.service`
 - `systemd/piaware/ais-rtl-tcp.service.d/10-rtl-antenna-picker.conf`
+- `systemd/piaware/rtl-antenna-picker-verify.service` and `.timer`
+
+The PiAware profile runs with `--learn`, because an RF fingerprint alone can be
+fooled: an LNA stick wins every band median on its own noise, and antennas
+indoors hear almost nothing. With `--learn` the picker:
+
+- remembers the chosen role -> USB serial mapping in
+  `/var/lib/rtl-antenna-picker/roles-by-serial.json` and reuses it on later
+  boots, so kernel index reordering does not matter;
+- on a first boot with an ambiguous fingerprint takes the best guess instead
+  of failing, so the receivers always come up;
+- is corrected by the hourly `rtl-antenna-picker-verify.timer`: when
+  `dump1090-fa` decoded fewer than 5 messages over 12+ hours, that dongle is
+  marked deaf, the roles swap and the receivers restart. When both dongles are
+  deaf it stops swapping; deaf marks expire after 7 days.
 
 After installing the package, the built-artifact installer can copy those templates and substitute the real `rtl-antenna-picker` executable path:
 
@@ -152,12 +167,13 @@ Read [`docs/piaware-ais-systemd.md`](docs/piaware-ais-systemd.md) before the fir
 
 ## Safety model
 
-This tool intentionally prefers failing closed over silently swapping antennas:
+Without `--learn` this tool intentionally prefers failing closed over silently swapping antennas:
 
 - it requires at least as many RTL-SDR devices as roles;
 - role-specific `--min-role-delta NAME=DB` guards fail if the selected device is not sufficiently distinguishable;
 - it records all measured medians, p95 values, peaks, and peak frequencies;
-- it does not restart or kill services by itself.
+- it does not restart or kill services by itself; only `--verify-role` restarts
+  the configured `--restart-units` after a swap backed by decoded traffic.
 
 ## Development checks
 

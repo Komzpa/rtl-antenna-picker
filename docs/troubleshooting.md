@@ -22,15 +22,12 @@ Options:
 - run again when local RF noise is lower or signals are present;
 - inspect `/var/lib/rtl-antenna-picker/latest.json` from previous successful runs;
 - lower `--min-role-delta NAME=DB` only if you understand the risk.
-- if the dongles have unique USB serials, verify the right mapping by decoding
-  (for example run `dump1090-fa` on each index side by side and compare message
-  counts), then pin it with `--pin-serial NAME=SERIAL` for every role, e.g. in
-  `/etc/default/rtl-antenna-picker` as
-  `RTL_ANTENNA_PICKER_ARGS="--pin-serial adsb=... --pin-serial ais=..."`.
-  A loud band median can be local noise rather than an antenna; decoded
-  traffic is the ground truth. Serials come from `rtl_test -t`.
+- with `--learn` (the PiAware profile) this does not fail: the best guess is
+  used and remembered, and `rtl-antenna-picker-verify.timer` swaps it if the
+  ADS-B dongle decodes nothing; `--pin-serial NAME=SERIAL` remains as an
+  explicit override.
 
-Failing here is deliberate. A wrong automatic choice is worse than a noisy boot failure.
+Without `--learn`, failing here is deliberate. A wrong automatic choice is worse than a noisy boot failure.
 
 ## A role got a surprising device
 

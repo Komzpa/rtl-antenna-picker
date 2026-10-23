@@ -1,0 +1,9 @@
+[Unit]
+Description=Swap RTL-SDR roles when the ADS-B dongle decodes nothing
+Documentation=https://github.com/Komzpa/rtl-antenna-picker
+After=dump1090-fa.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/rtl-antenna-picker
+ExecStart=@RTL_ANTENNA_PICKER@ --state-dir /var/lib/rtl-antenna-picker --verify-role adsb $RTL_ANTENNA_PICKER_VERIFY_ARGS
