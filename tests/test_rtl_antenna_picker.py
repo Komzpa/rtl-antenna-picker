@@ -210,3 +210,64 @@ def test_build_runtime_config_accepts_generic_roles_and_strategy(tmp_path):
 def test_role_delta_rejects_negative_or_non_finite(raw):
     with pytest.raises(argparse.ArgumentTypeError):
         rtl_antenna_picker.parse_role_delta_arg(raw)
+
+
+BALCONY_RTL_TEST = """Found 2 device(s):
+  0:  Realtek, RTL2838UHIDIR, SN: 00001090
+  1:  Generic, RTL2832U, SN: 77771111153705700
+"""
+
+DEFAULT_ROLES = [
+    rtl_antenna_picker.RoleSpec("ais", "156M:163M:5k"),
+    rtl_antenna_picker.RoleSpec("adsb", "1088M:1092M:5k"),
+]
+
+
+def test_parse_rtl_test_serials():
+    assert rtl_antenna_picker.parse_rtl_test_serials(BALCONY_RTL_TEST) == {0: "00001090", 1: "77771111153705700"}
+
+
+def test_select_by_serial_follows_serial_not_index():
+    serials = rtl_antenna_picker.parse_rtl_test_serials(BALCONY_RTL_TEST)
+    pins = {"adsb": "77771111153705700", "ais": "00001090"}
+
+    selection = rtl_antenna_picker.select_by_serial(DEFAULT_ROLES, pins, serials)
+    swapped = rtl_antenna_picker.select_by_serial(DEFAULT_ROLES, pins, {0: serials[1], 1: serials[0]})
+
+    assert selection.assignments == {"ais": 0, "adsb": 1}
+    assert swapped.assignments == {"ais": 1, "adsb": 0}
+    assert selection.assignment_strategy == "serial-pin"
+    env = rtl_antenna_picker.shell_env_lines(selection, "2026-10-24T00:00:00+00:00")
+    assert "AIS_RTL_INDEX=0" in env and "ADSB_RTL_INDEX=1" in env
+
+
+@pytest.mark.parametrize(
+    "pins, serials, message",
+    [
+        ({"adsb": "missing", "ais": "00001090"}, {0: "00001090", 1: "7777"}, "matched 0 devices"),
+        ({"adsb": "dup", "ais": "00001090"}, {0: "dup", 1: "dup", 2: "00001090"}, "matched 2 devices"),
+        ({"adsb": "7777"}, {0: "00001090", 1: "7777"}, "missing: ais"),
+        ({"adsb": "7777", "ais": "7777"}, {0: "00001090", 1: "7777"}, "one device"),
+        ({"adsb": "7777", "ais": "00001090", "vhf": "x"}, {0: "00001090", 1: "7777"}, "unknown roles"),
+    ],
+)
+def test_select_by_serial_rejects_bad_pins(pins, serials, message):
+    with pytest.raises(ValueError, match=message):
+        rtl_antenna_picker.select_by_serial(DEFAULT_ROLES, pins, serials)
+
+
+def test_main_with_serial_pins_skips_rf_scan(tmp_path, monkeypatch):
+    monkeypatch.setattr(rtl_antenna_picker, "run_rtl_test", lambda *_: BALCONY_RTL_TEST)
+    monkeypatch.setattr(rtl_antenna_picker, "collect_metrics", lambda **_: pytest.fail("RF scan must not run"))
+    env_path = tmp_path / "picker.env"
+
+    rc = rtl_antenna_picker.main([
+        "--output-env", str(env_path),
+        "--state-dir", str(tmp_path / "state"),
+        "--pin-serial", "adsb=77771111153705700",
+        "--pin-serial", "ais=00001090",
+    ])
+
+    assert rc == 0
+    env = env_path.read_text()
+    assert "AIS_RTL_INDEX=0" in env and "ADSB_RTL_INDEX=1" in env

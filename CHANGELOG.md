@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Added `--pin-serial NAME=SERIAL` to assign roles by USB serial without an RF
+  scan, for hosts where noise defeats the fingerprint but serials are unique.
+- The systemd template reads host extras from `/etc/default/rtl-antenna-picker`
+  (`RTL_ANTENNA_PICKER_ARGS`).
+
 ## 0.2.0 - 2026-07-09
 
 - Generalized the picker from hardcoded AIS/ADS-B fields to configurable roles.

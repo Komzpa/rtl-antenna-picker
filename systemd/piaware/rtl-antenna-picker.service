@@ -7,7 +7,9 @@ Before=dump1090-fa.service ais-rtl-tcp.service
 
 [Service]
 Type=oneshot
-ExecStart=@RTL_ANTENNA_PICKER@ --output-env /run/rtl-antenna-picker.env --state-dir /var/lib/rtl-antenna-picker --apply-piaware --print-json
+# Host-specific extras, e.g. RTL_ANTENNA_PICKER_ARGS="--pin-serial adsb=SERIAL --pin-serial ais=SERIAL"
+EnvironmentFile=-/etc/default/rtl-antenna-picker
+ExecStart=@RTL_ANTENNA_PICKER@ --output-env /run/rtl-antenna-picker.env --state-dir /var/lib/rtl-antenna-picker --apply-piaware --print-json $RTL_ANTENNA_PICKER_ARGS
 RemainAfterExit=yes
 
 [Install]

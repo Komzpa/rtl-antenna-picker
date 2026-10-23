@@ -132,7 +132,14 @@ def parse_rtl_test_device_count(output: str) -> int | None:
     return int(match.group(1))
 
 
-def detect_device_count(rtl_test: str, timeout_seconds: float) -> int:
+def parse_rtl_test_serials(output: str) -> dict[int, str]:
+    return {
+        int(match.group(1)): match.group(2)
+        for match in re.finditer(r"^\s*(\d+):.*\bSN:\s*(\S+)", output, flags=re.MULTILINE)
+    }
+
+
+def run_rtl_test(rtl_test: str, timeout_seconds: float) -> str:
     result = subprocess.run(
         [rtl_test, "-t"],
         check=False,
@@ -140,7 +147,11 @@ def detect_device_count(rtl_test: str, timeout_seconds: float) -> int:
         capture_output=True,
         timeout=timeout_seconds,
     )
-    output = f"{result.stdout}\n{result.stderr}"
+    return f"{result.stdout}\n{result.stderr}"
+
+
+def detect_device_count(rtl_test: str, timeout_seconds: float) -> int:
+    output = run_rtl_test(rtl_test, timeout_seconds)
     count = parse_rtl_test_device_count(output)
     if count is None:
         raise RuntimeError(f"could not parse RTL device count from {rtl_test} -t output:\n{output}")
@@ -182,6 +193,13 @@ def parse_role_delta_arg(raw: str) -> tuple[str, float]:
     if not math.isfinite(delta) or delta < 0:
         raise argparse.ArgumentTypeError("role delta must be a finite non-negative number")
     return normalize_role_name(name), delta
+
+
+def parse_pin_serial_arg(raw: str) -> tuple[str, str]:
+    name, sep, serial = raw.partition("=")
+    if not sep or not name.strip() or not serial.strip():
+        raise argparse.ArgumentTypeError("serial pin must be NAME=SERIAL, for example adsb=00001090")
+    return normalize_role_name(name), serial.strip()
 
 
 def load_json_config(path: Path | None) -> dict[str, object]:
@@ -427,6 +445,44 @@ def choose_selection(
     )
 
 
+def select_by_serial(
+    roles: Sequence[RoleSpec],
+    pins: dict[str, str],
+    serials: dict[int, str],
+    score_stat: str = "median",
+) -> Selection:
+    """Assign every role to the device carrying its pinned USB serial.
+
+    Use this when RF fingerprints are ambiguous but serials are unique: the
+    kernel index of a serial can move between boots, the serial cannot.
+    """
+    role_names = {role.name for role in roles}
+    unknown = sorted(set(pins) - role_names)
+    if unknown:
+        raise ValueError(f"serial pins for unknown roles: {', '.join(unknown)}")
+    unpinned = [role.name for role in roles if role.name not in pins]
+    if unpinned:
+        raise ValueError(f"serial pinning needs a pin for every role; missing: {', '.join(unpinned)}")
+
+    assignments: dict[str, int] = {}
+    for role in roles:
+        matches = [index for index, serial in serials.items() if serial == pins[role.name]]
+        if len(matches) != 1:
+            raise ValueError(f"{role.name} serial {pins[role.name]!r} matched {len(matches)} devices: {serials}")
+        assignments[role.name] = matches[0]
+    if len(set(assignments.values())) != len(assignments):
+        raise ValueError(f"serial pins map several roles to one device: {assignments}")
+
+    return Selection(
+        assignments=assignments,
+        role_deltas_db={role.name: math.inf for role in roles},
+        metrics=[],
+        roles=list(roles),
+        score_stat=score_stat,
+        assignment_strategy="serial-pin",
+    )
+
+
 def shell_env_lines(selection: Selection, timestamp: str) -> list[str]:
     role_names = [role.name for role in selection.roles]
     lines = [
@@ -655,6 +711,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-ais-median-delta-db", type=float, default=DEFAULT_MIN_AIS_MEDIAN_DELTA_DB, help="legacy shortcut for --min-role-delta ais=DB")
     parser.add_argument("--apply-piaware", action="store_true", help="write PiAware rtlsdr-device-index to the selected --piaware-role index")
     parser.add_argument("--piaware-role", default="adsb", help="selected role to apply to PiAware when --apply-piaware is used")
+    parser.add_argument("--pin-serial", type=parse_pin_serial_arg, action="append", metavar="NAME=SERIAL", help="assign the role to the device with this USB serial instead of measuring RF; repeat for every role")
     parser.add_argument("--print-json", action="store_true")
     return parser
 
@@ -665,6 +722,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     runtime = build_runtime_config(args)
 
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    if args.pin_serial:
+        serials = parse_rtl_test_serials(run_rtl_test(args.rtl_test, args.command_timeout))
+        selection = select_by_serial(runtime.roles, dict(args.pin_serial), serials, runtime.score_stat)
+        return emit_selection(args, runtime, selection, timestamp)
+
     if args.device_index:
         device_indexes = sorted(dict.fromkeys(args.device_index))
     else:
@@ -690,6 +752,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     selection = choose_selection(metrics, runtime.roles, runtime.score_stat, runtime.assignment_strategy)
+    return emit_selection(args, runtime, selection, timestamp)
+
+
+def emit_selection(args: argparse.Namespace, runtime: RuntimeConfig, selection: Selection, timestamp: str) -> int:
     payload = selection_payload(selection, timestamp, runtime)
 
     env_text = "\n".join(shell_env_lines(selection, timestamp)) + "\n"
