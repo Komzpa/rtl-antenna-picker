@@ -7,8 +7,8 @@ Before=dump1090-fa.service ais-rtl-tcp.service
 
 [Service]
 Type=oneshot
-# --learn: remember roles by USB serial, never fail on an ambiguous fingerprint;
-# rtl-antenna-picker-verify.timer corrects the guess from decoded traffic.
+# --learn: remember the last decisive mapping by USB serial and use it (or the
+# best guess) instead of failing when a boot-time fingerprint is ambiguous.
 # Host-specific extras go to RTL_ANTENNA_PICKER_ARGS.
 EnvironmentFile=-/etc/default/rtl-antenna-picker
 ExecStart=@RTL_ANTENNA_PICKER@ --output-env /run/rtl-antenna-picker.env --state-dir /var/lib/rtl-antenna-picker --apply-piaware --print-json --learn $RTL_ANTENNA_PICKER_ARGS

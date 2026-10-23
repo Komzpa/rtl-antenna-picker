@@ -28,6 +28,10 @@ from typing import Sequence
 
 DEFAULT_AIS_BAND = "156M:163M:5k"
 DEFAULT_ADSB_BAND = "1088M:1092M:5k"
+# AIS chains are VHF-filtered or tuned near 162 MHz, so the AIS band rises far
+# above the same device's FM band; wideband or 1090 chains do not. Absolute
+# levels mostly measure dongle gain and LNA noise instead.
+DEFAULT_AIS_REFERENCE_BAND = "88M:108M:20k"
 DEFAULT_GAIN = "33.8"
 DEFAULT_INTEGRATION = "1"
 DEFAULT_DURATION = "3s"
@@ -35,8 +39,6 @@ DEFAULT_MIN_AIS_MEDIAN_DELTA_DB = 6.0
 SCORE_STATS = ("median", "p95", "peak")
 ASSIGNMENT_STRATEGIES = ("priority", "maximize-total")
 MEMORY_FILE = "roles-by-serial.json"
-DEFAULT_DUMP1090_STATS = "/run/dump1090-fa/stats.json"
-DEFAULT_VERIFY_UNITS = "rtl-antenna-picker.service dump1090-fa.service ais-rtl-tcp.service"
 ROLE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
 ENV_SAFE_RE = re.compile(r"[^A-Za-z0-9]")
 
@@ -55,6 +57,11 @@ class RoleSpec:
     name: str
     band: str
     min_delta_db: float | None = None
+    reference_band: str | None = None
+
+    @property
+    def reference_key(self) -> str:
+        return f"{self.name}:reference"
 
 
 @dataclass(frozen=True)
@@ -186,6 +193,13 @@ def parse_role_arg(raw: str) -> RoleSpec:
     return RoleSpec(name=name, band=band)
 
 
+def parse_role_reference_arg(raw: str) -> tuple[str, str]:
+    name, sep, band = raw.partition("=")
+    if not sep or not name.strip():
+        raise argparse.ArgumentTypeError("role reference must be NAME=BAND, for example ais=88M:108M:20k")
+    return normalize_role_name(name), band.strip()
+
+
 def parse_role_delta_arg(raw: str) -> tuple[str, float]:
     if "=" not in raw:
         raise argparse.ArgumentTypeError("role delta must be NAME=DB, for example ais=6")
@@ -231,11 +245,24 @@ def roles_from_config(payload: dict[str, object]) -> list[RoleSpec]:
             min_delta = float(min_delta)
             if not math.isfinite(min_delta) or min_delta < 0:
                 raise ValueError("config min_delta_db must be a finite non-negative number")
-        roles.append(RoleSpec(normalize_role_name(str(item["name"])), str(item["band"]), min_delta))
+        reference = item.get("reference_band")
+        roles.append(
+            RoleSpec(
+                normalize_role_name(str(item["name"])),
+                str(item["band"]),
+                min_delta,
+                str(reference) if reference else None,
+            )
+        )
     return roles
 
 
-def merge_roles(base_roles: Sequence[RoleSpec], overrides: dict[str, float]) -> list[RoleSpec]:
+def merge_roles(
+    base_roles: Sequence[RoleSpec],
+    overrides: dict[str, float],
+    reference_overrides: dict[str, str] | None = None,
+) -> list[RoleSpec]:
+    reference_overrides = reference_overrides or {}
     seen_env_names: dict[str, str] = {}
     merged: list[RoleSpec] = []
     for role in base_roles:
@@ -246,7 +273,8 @@ def merge_roles(base_roles: Sequence[RoleSpec], overrides: dict[str, float]) -> 
         seen_env_names[env_name] = role.name
         if any(existing.name == role.name for existing in merged):
             raise ValueError(f"duplicate role name {role.name!r}")
-        merged.append(RoleSpec(role.name, role.band, min_delta))
+        reference = reference_overrides.get(role.name, role.reference_band) or None
+        merged.append(RoleSpec(role.name, role.band, min_delta, reference))
     if not merged:
         raise ValueError("at least one role is required")
     return merged
@@ -267,7 +295,7 @@ def build_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         roles = [role_by_name[name] for name in order]
     else:
         roles = [
-            RoleSpec("ais", args.ais_band, args.min_ais_median_delta_db),
+            RoleSpec("ais", args.ais_band, args.min_ais_median_delta_db, args.ais_reference_band or None),
             RoleSpec("adsb", args.adsb_band, None),
         ]
 
@@ -277,7 +305,7 @@ def build_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     if "ais" not in delta_overrides and any(role.name == "ais" and role.min_delta_db is None for role in roles):
         delta_overrides["ais"] = args.min_ais_median_delta_db
 
-    roles = merge_roles(roles, delta_overrides)
+    roles = merge_roles(roles, delta_overrides, dict(args.role_reference or []))
     score_stat = str(config.get("score_stat", args.score_stat))
     if score_stat not in SCORE_STATS:
         raise ValueError(f"score_stat must be one of {', '.join(SCORE_STATS)}")
@@ -302,6 +330,13 @@ def band_score(summary: BandSummary, stat: str) -> float:
     if stat == "peak":
         return summary.peak_db
     raise ValueError(f"unsupported score stat {stat!r}")
+
+
+def role_score(metric: DeviceMetrics, role: RoleSpec, stat: str) -> float:
+    score = band_score(metric.role_summaries[role.name], stat)
+    if role.reference_band:
+        score -= band_score(metric.role_summaries[role.reference_key], stat)
+    return score
 
 
 def run_rtl_power(
@@ -366,6 +401,19 @@ def collect_metrics(
                 output_path=output_path,
             )
             role_summaries[role.name] = parse_rtl_power_csv(output_path)
+            if role.reference_band:
+                reference_path = work_dir / f"device{index}-{role_env_name(role.name).lower()}-reference.csv"
+                run_rtl_power(
+                    rtl_power=rtl_power,
+                    device_index=index,
+                    band=role.reference_band,
+                    gain=gain,
+                    integration=integration,
+                    duration=duration,
+                    timeout_seconds=timeout_seconds,
+                    output_path=reference_path,
+                )
+                role_summaries[role.reference_key] = parse_rtl_power_csv(reference_path)
         metrics.append(DeviceMetrics(index=index, role_summaries=role_summaries))
     return metrics
 
@@ -395,6 +443,8 @@ def choose_selection(
         for metric in metrics:
             if role.name not in metric.role_summaries:
                 raise ValueError(f"missing metrics for role {role.name!r} on device {metric.index}")
+            if role.reference_band and role.reference_key not in metric.role_summaries:
+                raise ValueError(f"missing reference metrics for role {role.name!r} on device {metric.index}")
 
     if assignment_strategy == "priority":
         remaining = set(device_indexes)
@@ -402,7 +452,7 @@ def choose_selection(
         for role in roles:
             selected_index = max(
                 remaining,
-                key=lambda index: (band_score(metrics_by_index[index].role_summaries[role.name], score_stat), -index),
+                key=lambda index: (role_score(metrics_by_index[index], role, score_stat), -index),
             )
             best_assignment[role.name] = selected_index
             remaining.remove(selected_index)
@@ -412,7 +462,7 @@ def choose_selection(
         for candidate_indexes in itertools.permutations(device_indexes, len(roles)):
             score = 0.0
             for role, index in zip(roles, candidate_indexes, strict=True):
-                score += band_score(metrics_by_index[index].role_summaries[role.name], score_stat)
+                score += role_score(metrics_by_index[index], role, score_stat)
             assignment = {role.name: index for role, index in zip(roles, candidate_indexes, strict=True)}
             tie_break = tuple(candidate_indexes)
             best_tie_break = tuple(best_assignment[role.name] for role in roles) if best_assignment else ()
@@ -426,9 +476,9 @@ def choose_selection(
     ambiguous: list[str] = []
     for role in roles:
         selected_index = best_assignment[role.name]
-        selected_score = band_score(metrics_by_index[selected_index].role_summaries[role.name], score_stat)
+        selected_score = role_score(metrics_by_index[selected_index], role, score_stat)
         runner_up_scores = [
-            band_score(metric.role_summaries[role.name], score_stat)
+            role_score(metric, role, score_stat)
             for metric in metrics
             if metric.index != selected_index
         ]
@@ -536,58 +586,6 @@ def select_from_memory(
     return replace(selection, assignment_strategy="memory")
 
 
-def verify_decoding_role(
-    memory: dict,
-    stats: dict,
-    *,
-    role: str,
-    now: float,
-    window_seconds: float,
-    min_messages: int,
-    deaf_expiry_seconds: float,
-) -> tuple[dict, str]:
-    """Check the live decoder of ``role`` and swap roles when its dongle stays deaf.
-
-    Returns the updated memory and one of: no-memory, wait, ok, swap, all-deaf.
-    A dongle that decoded fewer than ``min_messages`` over at least
-    ``window_seconds`` is marked deaf; the role then moves to the other
-    dongle unless that one is also marked deaf. Deaf marks expire so a
-    re-cabled antenna gets another chance.
-    """
-
-    pins = memory.get("roles")
-    if not isinstance(pins, dict) or role not in pins or len(pins) != 2:
-        return memory, "no-memory"
-
-    total = stats.get("total", {})
-    window = float(total.get("end", 0)) - float(total.get("start", 0))
-    if window < window_seconds:
-        return memory, "wait"
-    decoded = sum(total.get("local", {}).get("accepted", []) or [0])
-
-    updated = dict(memory)
-    deaf = {
-        serial: marked
-        for serial, marked in dict(memory.get("deaf", {})).items()
-        if now - float(marked) < deaf_expiry_seconds
-    }
-    serial = pins[role]
-    if decoded >= min_messages:
-        deaf.pop(serial, None)
-        updated["deaf"] = deaf
-        updated["verified"] = {**dict(memory.get("verified", {})), role: now}
-        return updated, "ok"
-
-    deaf[serial] = now
-    updated["deaf"] = deaf
-    other_role = next(name for name in pins if name != role)
-    if pins[other_role] in deaf:
-        return updated, "all-deaf"
-    updated["roles"] = {role: pins[other_role], other_role: serial}
-    updated["source"] = f"verify-swap: {role} decoded {decoded} in {window / 3600:.1f} h"
-    return updated, "swap"
-
-
 def shell_env_lines(selection: Selection, timestamp: str) -> list[str]:
     role_names = [role.name for role in selection.roles]
     lines = [
@@ -658,11 +656,17 @@ def selection_payload(selection: Selection, timestamp: str, runtime: RuntimeConf
         "timestamp": timestamp,
         "selected": selected,
         "bands": {role.name: role.band for role in selection.roles},
+        "reference_bands": {role.name: role.reference_band for role in selection.roles if role.reference_band},
         "rtl_power": {"gain": runtime.gain, "integration": runtime.integration, "duration": runtime.duration},
         "metrics": [
             {
                 "index": metric.index,
                 "roles": {role.name: asdict(metric.role_summaries[role.name]) for role in selection.roles},
+                "references": {
+                    role.name: asdict(metric.role_summaries[role.reference_key])
+                    for role in selection.roles
+                    if role.reference_key in metric.role_summaries
+                },
             }
             for metric in selection.metrics
         ],
@@ -749,9 +753,6 @@ def install_piaware_ais_systemd_main(argv: Sequence[str] | None = None) -> int:
         ),
     ]
 
-    for unit_name in ("rtl-antenna-picker-verify.service", "rtl-antenna-picker-verify.timer"):
-        operations.append((template_root / unit_name, args.systemd_dir / unit_name))
-
     existing_ais_unit = (args.systemd_dir / "ais-rtl-tcp.service").exists() or Path("/lib/systemd/system/ais-rtl-tcp.service").exists()
     if args.force_complete_ais_service or not existing_ais_unit:
         operations.append((template_root / "ais-rtl-tcp.service", args.systemd_dir / "ais-rtl-tcp.service"))
@@ -777,7 +778,6 @@ def install_piaware_ais_systemd_main(argv: Sequence[str] | None = None) -> int:
         subprocess.run(["systemctl", "daemon-reload"], check=True)
     if not args.dry_run and not args.no_enable:
         subprocess.run(["systemctl", "enable", "rtl-antenna-picker.service"], check=True)
-        subprocess.run(["systemctl", "enable", "--now", "rtl-antenna-picker-verify.timer"], check=True)
         if enable_ais:
             subprocess.run(["systemctl", "enable", "ais-rtl-tcp.service"], check=True)
 
@@ -808,6 +808,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device-count", type=int, help="override auto-detected RTL device count")
     parser.add_argument("--device-index", type=non_negative_int, action="append", help="measure only this runtime device index; repeatable")
     parser.add_argument("--role", type=parse_role_arg, action="append", metavar="NAME=BAND", help="role band to measure; repeatable, e.g. ais=156M:163M:5k")
+    parser.add_argument("--role-reference", type=parse_role_reference_arg, action="append", metavar="NAME=BAND", help="score the role by its band minus this reference band on the same device; empty BAND disables")
+    parser.add_argument("--ais-reference-band", default=DEFAULT_AIS_REFERENCE_BAND, help="reference band for the default AIS role; empty disables")
     parser.add_argument("--min-role-delta", type=parse_role_delta_arg, action="append", metavar="NAME=DB", help="require selected role to beat the next device by this dB delta")
     parser.add_argument("--score-stat", choices=SCORE_STATS, default="median", help="band summary statistic used for assignment")
     parser.add_argument("--assignment-strategy", choices=ASSIGNMENT_STRATEGIES, default="priority", help="role assignment strategy: priority assigns roles in CLI/config order; maximize-total optimizes total score")
@@ -822,12 +824,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--piaware-role", default="adsb", help="selected role to apply to PiAware when --apply-piaware is used")
     parser.add_argument("--pin-serial", type=parse_pin_serial_arg, action="append", metavar="NAME=SERIAL", help="assign the role to the device with this USB serial instead of measuring RF; repeat for every role")
     parser.add_argument("--learn", action="store_true", help="remember roles by USB serial, reuse them on later boots, and never fail on an ambiguous fingerprint (best guess instead)")
-    parser.add_argument("--verify-role", help="instead of selecting, check the live decoder stats for this role and swap roles in memory when its dongle stays deaf")
-    parser.add_argument("--decoder-stats", type=Path, default=Path(DEFAULT_DUMP1090_STATS), help="dump1090 stats.json used by --verify-role")
-    parser.add_argument("--verify-window-hours", type=positive_float, default=12.0)
-    parser.add_argument("--verify-min-messages", type=non_negative_int, default=5)
-    parser.add_argument("--deaf-expiry-days", type=positive_float, default=7.0)
-    parser.add_argument("--restart-units", default=DEFAULT_VERIFY_UNITS, help="units restarted after a verify swap; empty disables")
     parser.add_argument("--print-json", action="store_true")
     return parser
 
@@ -839,9 +835,6 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
     memory_path = args.state_dir / MEMORY_FILE
-    if args.verify_role:
-        return verify_main(args, memory_path)
-
     if args.pin_serial:
         serials = parse_rtl_test_serials(run_rtl_test(args.rtl_test, args.command_timeout))
         selection = select_by_serial(runtime.roles, dict(args.pin_serial), serials, runtime.score_stat)
@@ -853,9 +846,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         rtl_test_output = run_rtl_test(args.rtl_test, args.command_timeout)
         serials = parse_rtl_test_serials(rtl_test_output)
         memory = load_memory(memory_path)
-        remembered = select_from_memory(runtime.roles, memory, serials, runtime.score_stat)
-        if remembered is not None:
-            return emit_selection(args, runtime, remembered, timestamp)
         if not args.device_index and not args.device_count:
             args.device_count = parse_rtl_test_device_count(rtl_test_output)
 
@@ -891,40 +881,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         require_decisive=not args.learn,
     )
     if args.learn:
-        if selection.ambiguous_roles:
+        if not selection.ambiguous_roles:
+            save_memory(memory_path, remember_selection(memory, selection, serials, "fingerprint", timestamp))
+        else:
+            remembered = select_from_memory(runtime.roles, memory, serials, runtime.score_stat)
+            fallback = "last decisive mapping by serial" if remembered is not None else "best guess"
             print(
-                f"rtl-antenna-picker: fingerprint not decisive for {', '.join(selection.ambiguous_roles)}; "
-                "using best guess, --verify-role will correct it from decoded traffic",
+                f"rtl-antenna-picker: fingerprint not decisive for {', '.join(selection.ambiguous_roles)}; using {fallback}",
                 file=sys.stderr,
             )
-        source = "fingerprint-ambiguous" if selection.ambiguous_roles else "fingerprint"
-        save_memory(memory_path, remember_selection(memory, selection, serials, source, timestamp))
+            if remembered is not None:
+                selection = replace(remembered, metrics=selection.metrics)
     return emit_selection(args, runtime, selection, timestamp)
-
-
-def verify_main(args: argparse.Namespace, memory_path: Path) -> int:
-    role = normalize_role_name(args.verify_role)
-    memory = load_memory(memory_path)
-    try:
-        stats = json.loads(args.decoder_stats.read_text())
-    except FileNotFoundError:
-        print(f"rtl-antenna-picker: no decoder stats at {args.decoder_stats}", file=sys.stderr)
-        return 0
-    updated, action = verify_decoding_role(
-        memory,
-        stats,
-        role=role,
-        now=datetime.now(timezone.utc).timestamp(),
-        window_seconds=args.verify_window_hours * 3600,
-        min_messages=args.verify_min_messages,
-        deaf_expiry_seconds=args.deaf_expiry_days * 86400,
-    )
-    print(f"rtl-antenna-picker: verify {role}: {action}", file=sys.stderr)
-    if updated != memory:
-        save_memory(memory_path, updated)
-    if action == "swap" and args.restart_units.split():
-        subprocess.run(["systemctl", "restart", *args.restart_units.split()], check=True)
-    return 0
 
 
 def emit_selection(args: argparse.Namespace, runtime: RuntimeConfig, selection: Selection, timestamp: str) -> int:

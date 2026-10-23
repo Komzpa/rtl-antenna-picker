@@ -2,11 +2,13 @@
 
 ## Unreleased
 
-- Added `--learn`: remember roles by USB serial, reuse them on boot, and take
-  the best guess instead of failing on an ambiguous fingerprint.
-- Added `--verify-role NAME` and the hourly `rtl-antenna-picker-verify.timer`:
-  swap roles when the role's dongle decodes nothing for a full window, using
-  the live `dump1090-fa` stats; stop when every dongle is deaf.
+- Score a role against a reference band on the same device
+  (`--role-reference NAME=BAND`, config `reference_band`). The default AIS
+  role now uses `88M:108M:20k`: a VHF-filtered or tuned AIS chain rises ~25 dB
+  above its own FM band, while a wideband LNA chain wins absolute medians on
+  noise alone.
+- Added `--learn`: remember the last decisive mapping by USB serial and use it
+  (or the best guess) instead of failing when a boot measurement is ambiguous.
 - Added `--pin-serial NAME=SERIAL` to assign roles by USB serial without an RF
   scan, for hosts where noise defeats the fingerprint but serials are unique.
 - The systemd template reads host extras from `/etc/default/rtl-antenna-picker`

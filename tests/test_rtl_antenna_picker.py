@@ -274,136 +274,96 @@ def test_main_with_serial_pins_skips_rf_scan(tmp_path, monkeypatch):
     assert "AIS_RTL_INDEX=0" in env and "ADSB_RTL_INDEX=1" in env
 
 
-INDOOR_RACK_METRICS = [
-    # Measured 2026-10-24 with both antennas inside a computer rack: the LNA
-    # stick wins every band median on its own noise, not on an antenna.
-    metrics(0, ais=summary(-9.92), adsb=summary(-38.48)),
-    metrics(1, ais=summary(-12.43), adsb=summary(-43.74)),
+
+# Measured 2026-10-24 on the PiAware host with both antennas inside a
+# computer rack (rtl_power, gain 30, medians in dB): device 0 is a wideband
+# LNA chain that hears FM/LTE/GSM almost at clipping, device 1 is flat except
+# a VHF bandpass around 140-180 MHz.
+RACK_METRICS = [
+    metrics(0, ais=summary(-6.0), adsb=summary(-30.3), **{"ais:reference": summary(-3.9)}),
+    metrics(1, ais=summary(-6.3), adsb=summary(-31.7), **{"ais:reference": summary(-29.9)}),
 ]
-LEARN_ROLES = [
-    rtl_antenna_picker.RoleSpec("ais", "156M:163M:5k", 6.0),
-    rtl_antenna_picker.RoleSpec("adsb", "1088M:1092M:5k"),
-]
+AIS_REF = rtl_antenna_picker.RoleSpec("ais", "156M:163M:5k", 6.0, "88M:108M:20k")
+ADSB = rtl_antenna_picker.RoleSpec("adsb", "1088M:1092M:5k")
 SERIALS = {0: "00001090", 1: "77771111153705700"}
-HOUR = 3600.0
 
 
-def decoder_stats(hours, accepted):
-    return {"total": {"start": 1000.0, "end": 1000.0 + hours * HOUR, "local": {"accepted": accepted}}}
+def test_reference_band_finds_filtered_ais_chain_where_absolute_level_cannot():
+    absolute_ais = rtl_antenna_picker.RoleSpec("ais", "156M:163M:5k", 6.0)
+    with pytest.raises(ValueError, match="not decisive"):
+        rtl_antenna_picker.choose_selection(RACK_METRICS, [absolute_ais, ADSB])
+
+    selection = rtl_antenna_picker.choose_selection(RACK_METRICS, [AIS_REF, ADSB])
+
+    assert selection.assignments == {"ais": 1, "adsb": 0}
+    assert selection.role_deltas_db["ais"] == pytest.approx(25.7)
 
 
-def verify(memory, stats, now=10 * 24 * HOUR):
-    return rtl_antenna_picker.verify_decoding_role(
-        memory,
-        stats,
-        role="adsb",
-        now=now,
-        window_seconds=12 * HOUR,
-        min_messages=5,
-        deaf_expiry_seconds=7 * 24 * HOUR,
-    )
+def test_default_runtime_roles_use_fm_reference_for_ais():
+    args = rtl_antenna_picker.build_parser().parse_args([])
+    roles = rtl_antenna_picker.build_runtime_config(args).roles
+
+    assert roles[0].name == "ais" and roles[0].reference_band == "88M:108M:20k"
+    disabled = rtl_antenna_picker.build_runtime_config(rtl_antenna_picker.build_parser().parse_args(["--ais-reference-band", ""]))
+    assert disabled.roles[0].reference_band is None
 
 
 def test_ambiguous_fingerprint_is_best_guess_when_not_required():
-    with pytest.raises(ValueError, match="not decisive"):
-        rtl_antenna_picker.choose_selection(INDOOR_RACK_METRICS, LEARN_ROLES)
+    flat = [metrics(0, ais=summary(-10.0), adsb=summary(-30.0)), metrics(1, ais=summary(-12.0), adsb=summary(-31.0))]
+    roles = [rtl_antenna_picker.RoleSpec("ais", "156M:163M:5k", 6.0), ADSB]
 
-    selection = rtl_antenna_picker.choose_selection(INDOOR_RACK_METRICS, LEARN_ROLES, require_decisive=False)
+    selection = rtl_antenna_picker.choose_selection(flat, roles, require_decisive=False)
 
     assert selection.assignments == {"ais": 0, "adsb": 1}
     assert selection.ambiguous_roles == ("ais",)
 
 
 def test_memory_follows_serials_across_index_reordering():
-    selection = rtl_antenna_picker.choose_selection(INDOOR_RACK_METRICS, LEARN_ROLES, require_decisive=False)
-    memory = rtl_antenna_picker.remember_selection({}, selection, SERIALS, "fingerprint-ambiguous", "t")
+    selection = rtl_antenna_picker.choose_selection(RACK_METRICS, [AIS_REF, ADSB])
+    memory = rtl_antenna_picker.remember_selection({}, selection, SERIALS, "fingerprint", "t")
 
-    reordered = rtl_antenna_picker.select_from_memory(LEARN_ROLES, memory, {0: SERIALS[1], 1: SERIALS[0]})
-    replaced = rtl_antenna_picker.select_from_memory(LEARN_ROLES, memory, {0: SERIALS[0], 1: "new-dongle"})
+    reordered = rtl_antenna_picker.select_from_memory([AIS_REF, ADSB], memory, {0: SERIALS[1], 1: SERIALS[0]})
+    replaced = rtl_antenna_picker.select_from_memory([AIS_REF, ADSB], memory, {0: SERIALS[0], 1: "new-dongle"})
 
-    assert memory["roles"] == {"ais": "00001090", "adsb": "77771111153705700"}
-    assert reordered.assignments == {"ais": 1, "adsb": 0}
-    assert reordered.assignment_strategy == "memory"
+    assert memory["roles"] == {"ais": "77771111153705700", "adsb": "00001090"}
+    assert reordered.assignments == {"ais": 0, "adsb": 1}
     assert replaced is None
 
 
 def test_remember_skips_duplicate_serials():
-    selection = rtl_antenna_picker.choose_selection(INDOOR_RACK_METRICS, LEARN_ROLES, require_decisive=False)
+    selection = rtl_antenna_picker.choose_selection(RACK_METRICS, [AIS_REF, ADSB])
 
     assert rtl_antenna_picker.remember_selection({}, selection, {0: "same", 1: "same"}, "x", "t") == {}
 
 
-def test_verify_waits_for_a_full_window():
-    memory = {"roles": {"ais": "A", "adsb": "B"}}
-
-    assert verify(memory, decoder_stats(3, [0, 0])) == (memory, "wait")
-
-
-def test_verify_keeps_decoding_dongle_and_clears_deaf_mark():
-    memory = {"roles": {"ais": "A", "adsb": "B"}, "deaf": {"B": 9 * 24 * HOUR}}
-
-    updated, action = verify(memory, decoder_stats(12, [40, 3]))
-
-    assert action == "ok"
-    assert updated["roles"] == memory["roles"]
-    assert "B" not in updated["deaf"]
-
-
-def test_verify_swaps_away_from_deaf_dongle():
-    memory = {"roles": {"ais": "A", "adsb": "B"}}
-
-    updated, action = verify(memory, decoder_stats(12, [2, 0]))
-
-    assert action == "swap"
-    assert updated["roles"] == {"adsb": "A", "ais": "B"}
-    assert "B" in updated["deaf"]
-
-
-def test_verify_stops_swapping_when_both_dongles_are_deaf():
-    memory = {"roles": {"adsb": "A", "ais": "B"}, "deaf": {"B": 10 * 24 * HOUR - HOUR}}
-
-    updated, action = verify(memory, decoder_stats(12, [0, 0]))
-
-    assert action == "all-deaf"
-    assert updated["roles"] == memory["roles"]
-
-
-def test_verify_retries_dongle_after_deaf_mark_expires():
-    memory = {"roles": {"adsb": "A", "ais": "B"}, "deaf": {"B": 1 * 24 * HOUR}}
-
-    updated, action = verify(memory, decoder_stats(12, [0, 0]))
-
-    assert action == "swap"
-    assert updated["roles"] == {"adsb": "B", "ais": "A"}
-
-
-def test_main_learn_survives_ambiguous_boot_then_reuses_memory(tmp_path, monkeypatch):
+def _run_learn(tmp_path, monkeypatch, measured):
     rtl_test_output = "Found 2 device(s):\n" + BALCONY_RTL_TEST.split("\n", 1)[1]
     monkeypatch.setattr(rtl_antenna_picker, "run_rtl_test", lambda *_: rtl_test_output)
-    monkeypatch.setattr(rtl_antenna_picker, "collect_metrics", lambda **_: INDOOR_RACK_METRICS)
+    monkeypatch.setattr(rtl_antenna_picker, "collect_metrics", lambda **_: measured)
     argv = ["--output-env", str(tmp_path / "picker.env"), "--state-dir", str(tmp_path / "state"), "--learn"]
-
     assert rtl_antenna_picker.main(argv) == 0
-    memory = (tmp_path / "state" / rtl_antenna_picker.MEMORY_FILE).read_text()
-    assert '"source": "fingerprint-ambiguous"' in memory
+    return (tmp_path / "picker.env").read_text()
 
-    monkeypatch.setattr(rtl_antenna_picker, "collect_metrics", lambda **_: pytest.fail("memory must skip the RF scan"))
-    assert rtl_antenna_picker.main(argv) == 0
-    env = (tmp_path / "picker.env").read_text()
+
+def test_main_learn_remembers_decisive_and_reuses_it_when_ambiguous(tmp_path, monkeypatch):
+    env = _run_learn(tmp_path, monkeypatch, RACK_METRICS)
+    assert "AIS_RTL_INDEX=1" in env and "ADSB_RTL_INDEX=0" in env
+
+    # Next boot the measurement is useless (same level everywhere); memory wins over the guess.
+    flat = [
+        metrics(i, ais=summary(-10.0), adsb=summary(-30.0), **{"ais:reference": summary(-10.0)})
+        for i in (0, 1)
+    ]
+    env = _run_learn(tmp_path, monkeypatch, flat)
+    assert "AIS_RTL_INDEX=1" in env and "ADSB_RTL_INDEX=0" in env
+
+
+def test_main_learn_ambiguous_first_boot_uses_best_guess(tmp_path, monkeypatch):
+    flat = [
+        metrics(i, ais=summary(-10.0 - i), adsb=summary(-30.0), **{"ais:reference": summary(-10.0)})
+        for i in (0, 1)
+    ]
+    env = _run_learn(tmp_path, monkeypatch, flat)
+
     assert "AIS_RTL_INDEX=0" in env and "ADSB_RTL_INDEX=1" in env
-
-
-def test_main_verify_swap_saves_memory_and_restarts_units(tmp_path, monkeypatch):
-    state = tmp_path / "state"
-    state.mkdir()
-    (state / rtl_antenna_picker.MEMORY_FILE).write_text('{"roles": {"ais": "A", "adsb": "B"}}')
-    stats = tmp_path / "stats.json"
-    stats.write_text(json.dumps(decoder_stats(13, [0, 0])))
-    calls = []
-    monkeypatch.setattr(rtl_antenna_picker.subprocess, "run", lambda cmd, check: calls.append(cmd))
-
-    rc = rtl_antenna_picker.main(["--state-dir", str(state), "--verify-role", "adsb", "--decoder-stats", str(stats)])
-
-    assert rc == 0
-    assert json.loads((state / rtl_antenna_picker.MEMORY_FILE).read_text())["roles"] == {"adsb": "A", "ais": "B"}
-    assert calls == [["systemctl", "restart", "rtl-antenna-picker.service", "dump1090-fa.service", "ais-rtl-tcp.service"]]
+    assert not (tmp_path / "state" / rtl_antenna_picker.MEMORY_FILE).exists()

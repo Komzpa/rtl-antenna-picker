@@ -1,9 +1,0 @@
-[Unit]
-Description=Hourly check that the ADS-B dongle actually decodes traffic
-
-[Timer]
-OnBootSec=1h
-OnUnitActiveSec=1h
-
-[Install]
-WantedBy=timers.target

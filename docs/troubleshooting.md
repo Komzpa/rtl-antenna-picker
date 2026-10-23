@@ -22,10 +22,13 @@ Options:
 - run again when local RF noise is lower or signals are present;
 - inspect `/var/lib/rtl-antenna-picker/latest.json` from previous successful runs;
 - lower `--min-role-delta NAME=DB` only if you understand the risk.
-- with `--learn` (the PiAware profile) this does not fail: the best guess is
-  used and remembered, and `rtl-antenna-picker-verify.timer` swaps it if the
-  ADS-B dongle decodes nothing; `--pin-serial NAME=SERIAL` remains as an
-  explicit override.
+- look at the whole spectrum of every dongle (`rtl_power -f 24M:1760M:250k
+  -g 30 -1`) before trusting band levels: filters and LNAs show up as shapes,
+  and a reference band (`--role-reference NAME=BAND`) turns that shape into a
+  score;
+- with `--learn` (the PiAware profile) this does not fail: the last decisive
+  mapping by serial or the best guess is used; `--pin-serial NAME=SERIAL`
+  remains as an explicit override.
 
 Without `--learn`, failing here is deliberate. A wrong automatic choice is worse than a noisy boot failure.
 
