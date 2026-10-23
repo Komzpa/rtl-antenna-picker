@@ -22,22 +22,23 @@ import statistics
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from typing import Sequence
 
 DEFAULT_AIS_BAND = "156M:163M:5k"
 DEFAULT_ADSB_BAND = "1088M:1092M:5k"
-# AIS chains are VHF-filtered or tuned near 162 MHz, so the AIS band rises far
-# above the same device's FM band; wideband or 1090 chains do not. Absolute
-# levels mostly measure dongle gain and LNA noise instead.
-DEFAULT_AIS_REFERENCE_BAND = "88M:108M:20k"
+
 DEFAULT_GAIN = "33.8"
 DEFAULT_INTEGRATION = "1"
 DEFAULT_DURATION = "3s"
 DEFAULT_MIN_AIS_MEDIAN_DELTA_DB = 6.0
 SCORE_STATS = ("median", "p95", "peak")
-ASSIGNMENT_STRATEGIES = ("priority", "maximize-total")
+ASSIGNMENT_STRATEGIES = ("priority", "maximize-total", "votes")
+DEFAULT_VOTE_GAINS = ("10", "30", "45")
+DEFAULT_VOTE_MARGIN_DB = 6.0
+DEFAULT_MIN_VOTES = 3
 MEMORY_FILE = "roles-by-serial.json"
 ROLE_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]*$")
 ENV_SAFE_RE = re.compile(r"[^A-Za-z0-9]")
@@ -57,11 +58,46 @@ class RoleSpec:
     name: str
     band: str
     min_delta_db: float | None = None
-    reference_band: str | None = None
+
+
+@dataclass(frozen=True)
+class Feature:
+    """One spectral shape test: a role band against a reference band on the same device.
+
+    Comparing a device with itself cancels dongle gain and LNA noise, so the
+    score reflects filters and antennas rather than which stick is loudest.
+    """
+
+    role: str
+    band: str
+    reference: str
 
     @property
-    def reference_key(self) -> str:
-        return f"{self.name}:reference"
+    def name(self) -> str:
+        return f"{self.role}: {self.band} - {self.reference}"
+
+
+@dataclass(frozen=True)
+class Vote:
+    feature: str
+    gain: str
+    role: str
+    device: int | None
+    margin_db: float
+    scores: dict[int, float]
+
+
+# Independent views of the same question. An AIS chain is VHF-filtered or tuned
+# near 162 MHz, so its AIS band rises above its own FM, low-VHF and UHF bands;
+# an ADS-B chain rises at 1090 MHz above its own neighbours and above VHF.
+DEFAULT_FEATURES = (
+    Feature("ais", "156M:163M:5k", "88M:108M:25k"),
+    Feature("ais", "156M:163M:5k", "60M:80M:25k"),
+    Feature("ais", "156M:163M:5k", "200M:300M:50k"),
+    Feature("adsb", "1088M:1092M:5k", "1000M:1050M:25k"),
+    Feature("adsb", "1088M:1092M:5k", "1200M:1300M:50k"),
+    Feature("adsb", "1088M:1092M:5k", "156M:163M:5k"),
+)
 
 
 @dataclass(frozen=True)
@@ -79,6 +115,7 @@ class Selection:
     score_stat: str
     assignment_strategy: str
     ambiguous_roles: tuple[str, ...] = ()
+    votes: tuple[Vote, ...] = ()
 
     def index_for(self, role_name: str) -> int:
         return self.assignments[normalize_role_name(role_name)]
@@ -193,13 +230,6 @@ def parse_role_arg(raw: str) -> RoleSpec:
     return RoleSpec(name=name, band=band)
 
 
-def parse_role_reference_arg(raw: str) -> tuple[str, str]:
-    name, sep, band = raw.partition("=")
-    if not sep or not name.strip():
-        raise argparse.ArgumentTypeError("role reference must be NAME=BAND, for example ais=88M:108M:20k")
-    return normalize_role_name(name), band.strip()
-
-
 def parse_role_delta_arg(raw: str) -> tuple[str, float]:
     if "=" not in raw:
         raise argparse.ArgumentTypeError("role delta must be NAME=DB, for example ais=6")
@@ -230,6 +260,20 @@ def load_json_config(path: Path | None) -> dict[str, object]:
     return payload
 
 
+def features_from_config(payload: dict[str, object]) -> list[Feature]:
+    raw = payload.get("features")
+    if raw is None:
+        return list(DEFAULT_FEATURES)
+    if not isinstance(raw, list):
+        raise ValueError("config field 'features' must be a list")
+    features: list[Feature] = []
+    for item in raw:
+        if not isinstance(item, dict) or not {"role", "band", "reference"} <= set(item):
+            raise ValueError("each config feature needs 'role', 'band' and 'reference'")
+        features.append(Feature(normalize_role_name(str(item["role"])), str(item["band"]), str(item["reference"])))
+    return features
+
+
 def roles_from_config(payload: dict[str, object]) -> list[RoleSpec]:
     raw_roles = payload.get("roles", [])
     if not isinstance(raw_roles, list):
@@ -245,24 +289,11 @@ def roles_from_config(payload: dict[str, object]) -> list[RoleSpec]:
             min_delta = float(min_delta)
             if not math.isfinite(min_delta) or min_delta < 0:
                 raise ValueError("config min_delta_db must be a finite non-negative number")
-        reference = item.get("reference_band")
-        roles.append(
-            RoleSpec(
-                normalize_role_name(str(item["name"])),
-                str(item["band"]),
-                min_delta,
-                str(reference) if reference else None,
-            )
-        )
+        roles.append(RoleSpec(normalize_role_name(str(item["name"])), str(item["band"]), min_delta))
     return roles
 
 
-def merge_roles(
-    base_roles: Sequence[RoleSpec],
-    overrides: dict[str, float],
-    reference_overrides: dict[str, str] | None = None,
-) -> list[RoleSpec]:
-    reference_overrides = reference_overrides or {}
+def merge_roles(base_roles: Sequence[RoleSpec], overrides: dict[str, float]) -> list[RoleSpec]:
     seen_env_names: dict[str, str] = {}
     merged: list[RoleSpec] = []
     for role in base_roles:
@@ -273,8 +304,7 @@ def merge_roles(
         seen_env_names[env_name] = role.name
         if any(existing.name == role.name for existing in merged):
             raise ValueError(f"duplicate role name {role.name!r}")
-        reference = reference_overrides.get(role.name, role.reference_band) or None
-        merged.append(RoleSpec(role.name, role.band, min_delta, reference))
+        merged.append(RoleSpec(role.name, role.band, min_delta))
     if not merged:
         raise ValueError("at least one role is required")
     return merged
@@ -295,7 +325,7 @@ def build_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
         roles = [role_by_name[name] for name in order]
     else:
         roles = [
-            RoleSpec("ais", args.ais_band, args.min_ais_median_delta_db, args.ais_reference_band or None),
+            RoleSpec("ais", args.ais_band, args.min_ais_median_delta_db),
             RoleSpec("adsb", args.adsb_band, None),
         ]
 
@@ -305,7 +335,7 @@ def build_runtime_config(args: argparse.Namespace) -> RuntimeConfig:
     if "ais" not in delta_overrides and any(role.name == "ais" and role.min_delta_db is None for role in roles):
         delta_overrides["ais"] = args.min_ais_median_delta_db
 
-    roles = merge_roles(roles, delta_overrides, dict(args.role_reference or []))
+    roles = merge_roles(roles, delta_overrides)
     score_stat = str(config.get("score_stat", args.score_stat))
     if score_stat not in SCORE_STATS:
         raise ValueError(f"score_stat must be one of {', '.join(SCORE_STATS)}")
@@ -333,10 +363,7 @@ def band_score(summary: BandSummary, stat: str) -> float:
 
 
 def role_score(metric: DeviceMetrics, role: RoleSpec, stat: str) -> float:
-    score = band_score(metric.role_summaries[role.name], stat)
-    if role.reference_band:
-        score -= band_score(metric.role_summaries[role.reference_key], stat)
-    return score
+    return band_score(metric.role_summaries[role.name], stat)
 
 
 def run_rtl_power(
@@ -401,19 +428,7 @@ def collect_metrics(
                 output_path=output_path,
             )
             role_summaries[role.name] = parse_rtl_power_csv(output_path)
-            if role.reference_band:
-                reference_path = work_dir / f"device{index}-{role_env_name(role.name).lower()}-reference.csv"
-                run_rtl_power(
-                    rtl_power=rtl_power,
-                    device_index=index,
-                    band=role.reference_band,
-                    gain=gain,
-                    integration=integration,
-                    duration=duration,
-                    timeout_seconds=timeout_seconds,
-                    output_path=reference_path,
-                )
-                role_summaries[role.reference_key] = parse_rtl_power_csv(reference_path)
+
         metrics.append(DeviceMetrics(index=index, role_summaries=role_summaries))
     return metrics
 
@@ -443,8 +458,6 @@ def choose_selection(
         for metric in metrics:
             if role.name not in metric.role_summaries:
                 raise ValueError(f"missing metrics for role {role.name!r} on device {metric.index}")
-            if role.reference_band and role.reference_key not in metric.role_summaries:
-                raise ValueError(f"missing reference metrics for role {role.name!r} on device {metric.index}")
 
     if assignment_strategy == "priority":
         remaining = set(device_indexes)
@@ -586,6 +599,152 @@ def select_from_memory(
     return replace(selection, assignment_strategy="memory")
 
 
+def measurement_key(band: str, gain: str) -> str:
+    return f"{band}@{gain}"
+
+
+def collect_vote_metrics(
+    *,
+    rtl_power: str,
+    device_indexes: Sequence[int],
+    features: Sequence[Feature],
+    gains: Sequence[str],
+    integration: str,
+    duration: str,
+    timeout_seconds: float,
+    work_dir: Path,
+) -> list[DeviceMetrics]:
+    bands = list(dict.fromkeys(band for feature in features for band in (feature.band, feature.reference)))
+
+    def measure(index: int) -> DeviceMetrics:
+        summaries: dict[str, BandSummary] = {}
+        for gain in gains:
+            for number, band in enumerate(bands):
+                output_path = work_dir / f"device{index}-band{number}-gain{gain}.csv"
+                run_rtl_power(
+                    rtl_power=rtl_power,
+                    device_index=index,
+                    band=band,
+                    gain=gain,
+                    integration=integration,
+                    duration=duration,
+                    timeout_seconds=timeout_seconds,
+                    output_path=output_path,
+                )
+                summaries[measurement_key(band, gain)] = parse_rtl_power_csv(output_path)
+        return DeviceMetrics(index=index, role_summaries=summaries)
+
+    # Each dongle is independent hardware, so measure them at the same time.
+    with ThreadPoolExecutor(max_workers=max(1, len(device_indexes))) as pool:
+        return list(pool.map(measure, device_indexes))
+
+
+def cast_votes(
+    metrics: Sequence[DeviceMetrics],
+    features: Sequence[Feature],
+    gains: Sequence[str],
+    margin_db: float,
+) -> list[Vote]:
+    votes: list[Vote] = []
+    for gain in gains:
+        for feature in features:
+            scores = {
+                metric.index: metric.role_summaries[measurement_key(feature.band, gain)].median_db
+                - metric.role_summaries[measurement_key(feature.reference, gain)].median_db
+                for metric in metrics
+            }
+            ranked = sorted(scores, key=lambda index: (-scores[index], index))
+            margin = math.inf if len(ranked) == 1 else scores[ranked[0]] - scores[ranked[1]]
+            votes.append(
+                Vote(
+                    feature=feature.name,
+                    gain=gain,
+                    role=feature.role,
+                    device=ranked[0] if margin >= margin_db else None,
+                    margin_db=margin,
+                    scores=scores,
+                )
+            )
+    return votes
+
+
+def choose_by_votes(
+    metrics: Sequence[DeviceMetrics],
+    roles: Sequence[RoleSpec],
+    features: Sequence[Feature],
+    gains: Sequence[str],
+    margin_db: float = DEFAULT_VOTE_MARGIN_DB,
+    min_votes: int = DEFAULT_MIN_VOTES,
+    require_decisive: bool = True,
+) -> Selection:
+    """Assign roles from many feature x gain votes that must not contradict each other.
+
+    A vote counts only when one device beats the next by ``margin_db``.
+    The result is decisive when at least ``min_votes`` votes count, no role
+    gets counted votes for two devices, and no two roles claim one device.
+    Roles without counted votes take the remaining devices.
+    """
+
+    role_names = [role.name for role in roles]
+    unknown = sorted({feature.role for feature in features} - set(role_names))
+    if unknown:
+        raise ValueError(f"features reference unknown roles: {', '.join(unknown)}")
+    if len(metrics) < len(roles):
+        raise ValueError(f"need at least {len(roles)} RTL devices for {len(roles)} roles, found {len(metrics)}")
+
+    votes = cast_votes(metrics, features, gains, margin_db)
+    counted = [vote for vote in votes if vote.device is not None]
+    claimed: dict[str, set[int]] = {}
+    for vote in counted:
+        claimed.setdefault(vote.role, set()).add(vote.device)
+
+    problems: list[str] = []
+    if len(counted) < min_votes:
+        problems.append(f"only {len(counted)} of {len(votes)} votes beat {margin_db:.1f} dB, need {min_votes}")
+    for role, devices in claimed.items():
+        if len(devices) > 1:
+            problems.append(f"{role} votes disagree between devices {sorted(devices)}")
+    decided = {role: next(iter(devices)) for role, devices in claimed.items() if len(devices) == 1}
+    if len(set(decided.values())) != len(decided):
+        problems.append(f"roles claim the same device: {decided}")
+
+    # Best guess for anything undecided: per role, the device with the highest
+    # summed feature score among the devices still free.
+    totals = {
+        role: {
+            metric.index: sum(vote.scores[metric.index] for vote in votes if vote.role == role)
+            for metric in metrics
+        }
+        for role in role_names
+    }
+    assignments: dict[str, int] = {}
+    if not problems:
+        assignments.update(decided)
+    for role in role_names:
+        if role in assignments:
+            continue
+        free = [metric.index for metric in metrics if metric.index not in assignments.values()]
+        assignments[role] = max(free, key=lambda index: (totals[role][index], -index))
+
+    if problems and require_decisive:
+        raise ValueError("antenna fingerprint is not decisive: " + "; ".join(problems))
+
+    deltas = {
+        role: min((vote.margin_db for vote in counted if vote.role == role), default=0.0)
+        for role in role_names
+    }
+    return Selection(
+        assignments=assignments,
+        role_deltas_db=deltas,
+        metrics=list(metrics),
+        roles=list(roles),
+        score_stat="median",
+        assignment_strategy="votes",
+        ambiguous_roles=tuple(role_names) if problems else (),
+        votes=tuple(votes),
+    )
+
+
 def shell_env_lines(selection: Selection, timestamp: str) -> list[str]:
     role_names = [role.name for role in selection.roles]
     lines = [
@@ -602,8 +761,15 @@ def shell_env_lines(selection: Selection, timestamp: str) -> list[str]:
         delta_value = "inf" if math.isinf(delta) else f"{delta:.3f}"
         lines.append(f"RTL_{env_role}_{selection.score_stat.upper()}_DELTA_DB={delta_value}")
 
+    if selection.votes:
+        counted = [vote for vote in selection.votes if vote.device is not None]
+        lines.append(f"RTL_ANTENNA_PICKER_VOTES_COUNTED={len(counted)}")
+        lines.append(f"RTL_ANTENNA_PICKER_VOTES_TOTAL={len(selection.votes)}")
+
     for metric in selection.metrics:
         for role in selection.roles:
+            if role.name not in metric.role_summaries:
+                continue
             summary = metric.role_summaries[role.name]
             prefix = f"RTL_DEVICE_{metric.index}_{role_env_name(role.name)}"
             lines.extend(
@@ -655,18 +821,28 @@ def selection_payload(selection: Selection, timestamp: str, runtime: RuntimeConf
     return {
         "timestamp": timestamp,
         "selected": selected,
+        "votes": [
+            {
+                "feature": vote.feature,
+                "gain": vote.gain,
+                "role": vote.role,
+                "device": vote.device,
+                "margin_db": vote.margin_db,
+                "scores": {str(index): score for index, score in vote.scores.items()},
+            }
+            for vote in selection.votes
+        ],
         "bands": {role.name: role.band for role in selection.roles},
-        "reference_bands": {role.name: role.reference_band for role in selection.roles if role.reference_band},
         "rtl_power": {"gain": runtime.gain, "integration": runtime.integration, "duration": runtime.duration},
         "metrics": [
             {
                 "index": metric.index,
-                "roles": {role.name: asdict(metric.role_summaries[role.name]) for role in selection.roles},
-                "references": {
-                    role.name: asdict(metric.role_summaries[role.reference_key])
+                "roles": {
+                    role.name: asdict(metric.role_summaries[role.name])
                     for role in selection.roles
-                    if role.reference_key in metric.role_summaries
+                    if role.name in metric.role_summaries
                 },
+                "measurements": {key: asdict(summary) for key, summary in metric.role_summaries.items()},
             }
             for metric in selection.metrics
         ],
@@ -808,11 +984,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device-count", type=int, help="override auto-detected RTL device count")
     parser.add_argument("--device-index", type=non_negative_int, action="append", help="measure only this runtime device index; repeatable")
     parser.add_argument("--role", type=parse_role_arg, action="append", metavar="NAME=BAND", help="role band to measure; repeatable, e.g. ais=156M:163M:5k")
-    parser.add_argument("--role-reference", type=parse_role_reference_arg, action="append", metavar="NAME=BAND", help="score the role by its band minus this reference band on the same device; empty BAND disables")
-    parser.add_argument("--ais-reference-band", default=DEFAULT_AIS_REFERENCE_BAND, help="reference band for the default AIS role; empty disables")
     parser.add_argument("--min-role-delta", type=parse_role_delta_arg, action="append", metavar="NAME=DB", help="require selected role to beat the next device by this dB delta")
     parser.add_argument("--score-stat", choices=SCORE_STATS, default="median", help="band summary statistic used for assignment")
-    parser.add_argument("--assignment-strategy", choices=ASSIGNMENT_STRATEGIES, default="priority", help="role assignment strategy: priority assigns roles in CLI/config order; maximize-total optimizes total score")
+    parser.add_argument("--assignment-strategy", choices=ASSIGNMENT_STRATEGIES, default="votes", help="votes (default): many band-vs-reference features at several gains must agree; priority/maximize-total: legacy absolute band levels in CLI/config role order or by total score")
     parser.add_argument("--ais-band", default=DEFAULT_AIS_BAND, help="legacy/default AIS role band used when --role is absent")
     parser.add_argument("--adsb-band", default=DEFAULT_ADSB_BAND, help="legacy/default ADS-B role band used when --role is absent")
     parser.add_argument("--gain", default=DEFAULT_GAIN)
@@ -824,6 +998,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--piaware-role", default="adsb", help="selected role to apply to PiAware when --apply-piaware is used")
     parser.add_argument("--pin-serial", type=parse_pin_serial_arg, action="append", metavar="NAME=SERIAL", help="assign the role to the device with this USB serial instead of measuring RF; repeat for every role")
     parser.add_argument("--learn", action="store_true", help="remember roles by USB serial, reuse them on later boots, and never fail on an ambiguous fingerprint (best guess instead)")
+    parser.add_argument("--vote-gains", default=",".join(DEFAULT_VOTE_GAINS), help="comma-separated rtl_power gains; every feature votes once per gain")
+    parser.add_argument("--vote-margin-db", type=float, default=DEFAULT_VOTE_MARGIN_DB, help="a feature votes only when one device beats the next by this much")
+    parser.add_argument("--min-votes", type=non_negative_int, default=DEFAULT_MIN_VOTES)
     parser.add_argument("--print-json", action="store_true")
     return parser
 
@@ -860,7 +1037,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     if len(device_indexes) < len(runtime.roles):
         raise RuntimeError(f"need at least {len(runtime.roles)} RTL devices for roles {', '.join(role.name for role in runtime.roles)}")
 
+    features = features_from_config(load_json_config(args.config))
     args.state_dir.mkdir(parents=True, exist_ok=True)
+    if runtime.assignment_strategy == "votes":
+        gains = [gain.strip() for gain in args.vote_gains.split(",") if gain.strip()]
+        with tempfile.TemporaryDirectory(prefix="rtl-antenna-picker-", dir=str(args.state_dir)) as tmp_dir:
+            metrics = collect_vote_metrics(
+                rtl_power=args.rtl_power,
+                device_indexes=device_indexes,
+                features=features,
+                gains=gains,
+                integration=runtime.integration,
+                duration=runtime.duration,
+                timeout_seconds=args.command_timeout,
+                work_dir=Path(tmp_dir),
+            )
+        selection = choose_by_votes(
+            metrics,
+            runtime.roles,
+            features,
+            gains,
+            margin_db=args.vote_margin_db,
+            min_votes=args.min_votes,
+            require_decisive=not args.learn,
+        )
+        return finish_selection(args, runtime, selection, timestamp, memory, serials, memory_path)
+
     with tempfile.TemporaryDirectory(prefix="rtl-antenna-picker-", dir=str(args.state_dir)) as tmp_dir:
         metrics = collect_metrics(
             rtl_power=args.rtl_power,
@@ -880,6 +1082,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         runtime.assignment_strategy,
         require_decisive=not args.learn,
     )
+    return finish_selection(args, runtime, selection, timestamp, memory, serials, memory_path)
+
+
+def finish_selection(
+    args: argparse.Namespace,
+    runtime: RuntimeConfig,
+    selection: Selection,
+    timestamp: str,
+    memory: dict,
+    serials: dict[int, str],
+    memory_path: Path,
+) -> int:
     if args.learn:
         if not selection.ambiguous_roles:
             save_memory(memory_path, remember_selection(memory, selection, serials, "fingerprint", timestamp))
@@ -891,7 +1105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 file=sys.stderr,
             )
             if remembered is not None:
-                selection = replace(remembered, metrics=selection.metrics)
+                selection = replace(remembered, metrics=selection.metrics, votes=selection.votes)
     return emit_selection(args, runtime, selection, timestamp)
 
 

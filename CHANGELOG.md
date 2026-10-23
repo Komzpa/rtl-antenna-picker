@@ -2,11 +2,14 @@
 
 ## Unreleased
 
-- Score a role against a reference band on the same device
-  (`--role-reference NAME=BAND`, config `reference_band`). The default AIS
-  role now uses `88M:108M:20k`: a VHF-filtered or tuned AIS chain rises ~25 dB
-  above its own FM band, while a wideband LNA chain wins absolute medians on
-  noise alone.
+- New default `--assignment-strategy votes`: six spectral-shape features
+  (AIS band vs FM, low VHF and UHF; 1090 MHz vs its neighbours and vs VHF),
+  each measured on the same device so dongle gain and LNA noise cancel, at
+  gains 10/30/45. A feature votes only with a 6 dB margin; the decision needs
+  3+ counted votes, no role split between devices and no device claimed twice.
+  Dongles are measured in parallel. Config `features`, `--vote-gains`,
+  `--vote-margin-db`, `--min-votes`. The old absolute-level strategies remain
+  as `priority` / `maximize-total`.
 - Added `--learn`: remember the last decisive mapping by USB serial and use it
   (or the best guess) instead of failing when a boot measurement is ambiguous.
 - Added `--pin-serial NAME=SERIAL` to assign roles by USB serial without an RF

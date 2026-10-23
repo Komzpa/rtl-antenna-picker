@@ -1,5 +1,4 @@
 import argparse
-import json
 
 import pytest
 
@@ -275,55 +274,97 @@ def test_main_with_serial_pins_skips_rf_scan(tmp_path, monkeypatch):
 
 
 
-# Measured 2026-10-24 on the PiAware host with both antennas inside a
-# computer rack (rtl_power, gain 30, medians in dB): device 0 is a wideband
-# LNA chain that hears FM/LTE/GSM almost at clipping, device 1 is flat except
-# a VHF bandpass around 140-180 MHz.
-RACK_METRICS = [
-    metrics(0, ais=summary(-6.0), adsb=summary(-30.3), **{"ais:reference": summary(-3.9)}),
-    metrics(1, ais=summary(-6.3), adsb=summary(-31.7), **{"ais:reference": summary(-29.9)}),
-]
-AIS_REF = rtl_antenna_picker.RoleSpec("ais", "156M:163M:5k", 6.0, "88M:108M:20k")
-ADSB = rtl_antenna_picker.RoleSpec("adsb", "1088M:1092M:5k")
+
+# Band medians (dB) measured 2026-10-24 on the PiAware host, both antennas
+# inside a computer rack, rtl_power sweeps of both dongles at once. Device 0
+# is a wideband LNA stick near clipping on FM/LTE/GSM; device 1 is flat except
+# a VHF bandpass around 140-180 MHz. Nothing useful is heard at 1090 MHz.
+RACK_MEDIANS = {
+    0: {'156M:163M:5k@10': -24.8, '88M:108M:25k@10': -13.5, '60M:80M:25k@10': -9.8, '200M:300M:50k@10': -28.4, '1088M:1092M:5k@10': -32.1, '1000M:1050M:25k@10': -32.1, '1200M:1300M:50k@10': -32.2, '156M:163M:5k@30': -6.0, '88M:108M:25k@30': -4.0, '60M:80M:25k@30': -3.8, '200M:300M:50k@30': -10.2, '1088M:1092M:5k@30': -30.7, '1000M:1050M:25k@30': -28.7, '1200M:1300M:50k@30': -31.0, '156M:163M:5k@45': -0.5, '88M:108M:25k@45': -1.6, '60M:80M:25k@45': -0.1, '200M:300M:50k@45': 0.0, '1088M:1092M:5k@45': -23.9, '1000M:1050M:25k@45': -19.5, '1200M:1300M:50k@45': -25.9},
+    1: {'156M:163M:5k@10': -23.9, '88M:108M:25k@10': -31.9, '60M:80M:25k@10': -31.9, '200M:300M:50k@10': -31.9, '1088M:1092M:5k@10': -32.1, '1000M:1050M:25k@10': -32.0, '1200M:1300M:50k@10': -32.0, '156M:163M:5k@30': -6.2, '88M:108M:25k@30': -29.8, '60M:80M:25k@30': -30.7, '200M:300M:50k@30': -31.2, '1088M:1092M:5k@30': -31.6, '1000M:1050M:25k@30': -31.7, '1200M:1300M:50k@30': -31.6, '156M:163M:5k@45': 0.4, '88M:108M:25k@45': -18.7, '60M:80M:25k@45': -19.9, '200M:300M:50k@45': -24.6, '1088M:1092M:5k@45': -31.0, '1000M:1050M:25k@45': -30.8, '1200M:1300M:50k@45': -31.2},
+}
+GAINS = rtl_antenna_picker.DEFAULT_VOTE_GAINS
+FEATURES = rtl_antenna_picker.DEFAULT_FEATURES
+ROLES = [rtl_antenna_picker.RoleSpec("ais", "156M:163M:5k", 6.0), rtl_antenna_picker.RoleSpec("adsb", "1088M:1092M:5k")]
 SERIALS = {0: "00001090", 1: "77771111153705700"}
 
 
-def test_reference_band_finds_filtered_ais_chain_where_absolute_level_cannot():
-    absolute_ais = rtl_antenna_picker.RoleSpec("ais", "156M:163M:5k", 6.0)
-    with pytest.raises(ValueError, match="not decisive"):
-        rtl_antenna_picker.choose_selection(RACK_METRICS, [absolute_ais, ADSB])
+def device_metrics(medians):
+    return [
+        rtl_antenna_picker.DeviceMetrics(index=index, role_summaries={key: summary(value) for key, value in values.items()})
+        for index, values in medians.items()
+    ]
 
-    selection = rtl_antenna_picker.choose_selection(RACK_METRICS, [AIS_REF, ADSB])
 
+RACK = device_metrics(RACK_MEDIANS)
+
+
+def test_votes_pick_filtered_ais_chain_on_rack_measurements():
+    selection = rtl_antenna_picker.choose_by_votes(RACK, ROLES, FEATURES, GAINS)
+
+    counted = [vote for vote in selection.votes if vote.device is not None]
     assert selection.assignments == {"ais": 1, "adsb": 0}
-    assert selection.role_deltas_db["ais"] == pytest.approx(25.7)
+    assert len(selection.votes) == len(FEATURES) * len(GAINS)
+    assert all(vote.device == 1 for vote in counted if vote.role == "ais")
+    assert all(vote.device == 0 for vote in counted if vote.role == "adsb")
+    assert len(counted) >= 8
 
 
-def test_default_runtime_roles_use_fm_reference_for_ais():
-    args = rtl_antenna_picker.build_parser().parse_args([])
-    roles = rtl_antenna_picker.build_runtime_config(args).roles
+def test_overloaded_stick_vote_below_margin_abstains():
+    # At gain 45 the LNA stick lifts 1000-1050 MHz, so "1090 over 1000-1050"
+    # leans the wrong way by ~4 dB; it must abstain, not veto.
+    vote = next(
+        vote
+        for vote in rtl_antenna_picker.cast_votes(RACK, FEATURES, ["45"], 6.0)
+        if vote.feature == "adsb: 1088M:1092M:5k - 1000M:1050M:25k"
+    )
 
-    assert roles[0].name == "ais" and roles[0].reference_band == "88M:108M:20k"
-    disabled = rtl_antenna_picker.build_runtime_config(rtl_antenna_picker.build_parser().parse_args(["--ais-reference-band", ""]))
-    assert disabled.roles[0].reference_band is None
+    assert vote.device is None
+    assert vote.scores[1] > vote.scores[0]
 
 
-def test_ambiguous_fingerprint_is_best_guess_when_not_required():
-    flat = [metrics(0, ais=summary(-10.0), adsb=summary(-30.0)), metrics(1, ais=summary(-12.0), adsb=summary(-31.0))]
-    roles = [rtl_antenna_picker.RoleSpec("ais", "156M:163M:5k", 6.0), ADSB]
+def test_absolute_ais_level_alone_cannot_decide_rack():
+    absolute = [
+        metrics(index, ais=summary(values["156M:163M:5k@30"]), adsb=summary(values["1088M:1092M:5k@30"]))
+        for index, values in RACK_MEDIANS.items()
+    ]
 
-    selection = rtl_antenna_picker.choose_selection(flat, roles, require_decisive=False)
+    with pytest.raises(ValueError, match="not decisive"):
+        rtl_antenna_picker.choose_selection(absolute, ROLES)
 
-    assert selection.assignments == {"ais": 0, "adsb": 1}
-    assert selection.ambiguous_roles == ("ais",)
+
+def test_contradicting_counted_votes_are_not_decisive():
+    contradicting = {index: dict(values) for index, values in RACK_MEDIANS.items()}
+    contradicting[0]["156M:163M:5k@45"] = 30.0  # device 0 suddenly wins one AIS feature by a mile
+
+    with pytest.raises(ValueError, match="ais votes disagree"):
+        rtl_antenna_picker.choose_by_votes(device_metrics(contradicting), ROLES, FEATURES, GAINS)
+
+    guess = rtl_antenna_picker.choose_by_votes(device_metrics(contradicting), ROLES, FEATURES, GAINS, require_decisive=False)
+    assert guess.ambiguous_roles == ("ais", "adsb")
+
+
+def test_too_few_votes_are_not_decisive():
+    flat = {index: {key: -30.0 for key in RACK_MEDIANS[0]} for index in (0, 1)}
+
+    with pytest.raises(ValueError, match="only 0 of 18 votes"):
+        rtl_antenna_picker.choose_by_votes(device_metrics(flat), ROLES, FEATURES, GAINS)
+
+
+def test_features_from_config_default_and_custom():
+    assert rtl_antenna_picker.features_from_config({}) == list(FEATURES)
+    custom = rtl_antenna_picker.features_from_config({"features": [{"role": "ais", "band": "a", "reference": "b"}]})
+    assert custom == [rtl_antenna_picker.Feature("ais", "a", "b")]
+    with pytest.raises(ValueError):
+        rtl_antenna_picker.features_from_config({"features": [{"role": "ais"}]})
 
 
 def test_memory_follows_serials_across_index_reordering():
-    selection = rtl_antenna_picker.choose_selection(RACK_METRICS, [AIS_REF, ADSB])
+    selection = rtl_antenna_picker.choose_by_votes(RACK, ROLES, FEATURES, GAINS)
     memory = rtl_antenna_picker.remember_selection({}, selection, SERIALS, "fingerprint", "t")
 
-    reordered = rtl_antenna_picker.select_from_memory([AIS_REF, ADSB], memory, {0: SERIALS[1], 1: SERIALS[0]})
-    replaced = rtl_antenna_picker.select_from_memory([AIS_REF, ADSB], memory, {0: SERIALS[0], 1: "new-dongle"})
+    reordered = rtl_antenna_picker.select_from_memory(ROLES, memory, {0: SERIALS[1], 1: SERIALS[0]})
+    replaced = rtl_antenna_picker.select_from_memory(ROLES, memory, {0: SERIALS[0], 1: "new-dongle"})
 
     assert memory["roles"] == {"ais": "77771111153705700", "adsb": "00001090"}
     assert reordered.assignments == {"ais": 0, "adsb": 1}
@@ -331,7 +372,7 @@ def test_memory_follows_serials_across_index_reordering():
 
 
 def test_remember_skips_duplicate_serials():
-    selection = rtl_antenna_picker.choose_selection(RACK_METRICS, [AIS_REF, ADSB])
+    selection = rtl_antenna_picker.choose_by_votes(RACK, ROLES, FEATURES, GAINS)
 
     assert rtl_antenna_picker.remember_selection({}, selection, {0: "same", 1: "same"}, "x", "t") == {}
 
@@ -339,31 +380,25 @@ def test_remember_skips_duplicate_serials():
 def _run_learn(tmp_path, monkeypatch, measured):
     rtl_test_output = "Found 2 device(s):\n" + BALCONY_RTL_TEST.split("\n", 1)[1]
     monkeypatch.setattr(rtl_antenna_picker, "run_rtl_test", lambda *_: rtl_test_output)
-    monkeypatch.setattr(rtl_antenna_picker, "collect_metrics", lambda **_: measured)
+    monkeypatch.setattr(rtl_antenna_picker, "collect_vote_metrics", lambda **_: measured)
     argv = ["--output-env", str(tmp_path / "picker.env"), "--state-dir", str(tmp_path / "state"), "--learn"]
     assert rtl_antenna_picker.main(argv) == 0
     return (tmp_path / "picker.env").read_text()
 
 
 def test_main_learn_remembers_decisive_and_reuses_it_when_ambiguous(tmp_path, monkeypatch):
-    env = _run_learn(tmp_path, monkeypatch, RACK_METRICS)
+    env = _run_learn(tmp_path, monkeypatch, RACK)
     assert "AIS_RTL_INDEX=1" in env and "ADSB_RTL_INDEX=0" in env
+    assert "RTL_ANTENNA_PICKER_VOTES_TOTAL=18" in env
 
-    # Next boot the measurement is useless (same level everywhere); memory wins over the guess.
-    flat = [
-        metrics(i, ais=summary(-10.0), adsb=summary(-30.0), **{"ais:reference": summary(-10.0)})
-        for i in (0, 1)
-    ]
+    flat = device_metrics({index: {key: -30.0 for key in RACK_MEDIANS[0]} for index in (0, 1)})
     env = _run_learn(tmp_path, monkeypatch, flat)
     assert "AIS_RTL_INDEX=1" in env and "ADSB_RTL_INDEX=0" in env
 
 
 def test_main_learn_ambiguous_first_boot_uses_best_guess(tmp_path, monkeypatch):
-    flat = [
-        metrics(i, ais=summary(-10.0 - i), adsb=summary(-30.0), **{"ais:reference": summary(-10.0)})
-        for i in (0, 1)
-    ]
+    flat = device_metrics({index: {key: -30.0 for key in RACK_MEDIANS[0]} for index in (0, 1)})
     env = _run_learn(tmp_path, monkeypatch, flat)
 
-    assert "AIS_RTL_INDEX=0" in env and "ADSB_RTL_INDEX=1" in env
+    assert "AIS_RTL_INDEX=" in env
     assert not (tmp_path / "state" / rtl_antenna_picker.MEMORY_FILE).exists()

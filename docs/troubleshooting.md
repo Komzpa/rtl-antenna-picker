@@ -24,8 +24,8 @@ Options:
 - lower `--min-role-delta NAME=DB` only if you understand the risk.
 - look at the whole spectrum of every dongle (`rtl_power -f 24M:1760M:250k
   -g 30 -1`) before trusting band levels: filters and LNAs show up as shapes,
-  and a reference band (`--role-reference NAME=BAND`) turns that shape into a
-  score;
+  and the vote features (`--print-json` lists every vote with per-device
+  scores) turn those shapes into decisions;
 - with `--learn` (the PiAware profile) this does not fail: the last decisive
   mapping by serial or the best guess is used; `--pin-serial NAME=SERIAL`
   remains as an explicit override.

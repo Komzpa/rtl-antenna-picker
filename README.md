@@ -142,11 +142,21 @@ The repository includes optional systemd templates for a PiAware + AIS RTLTCP st
 - `systemd/piaware/ais-rtl-tcp.service`
 - `systemd/piaware/ais-rtl-tcp.service.d/10-rtl-antenna-picker.conf`
 
-The default AIS role is scored as its band median minus the same device's
-`88M:108M:20k` (FM) median, not as an absolute level: an AIS chain behind a
-VHF bandpass or a 162 MHz antenna rises far above its own FM band, while a
-wideband LNA stick is loud everywhere and would win any absolute comparison.
-Disable with `--ais-reference-band ''`.
+The default strategy is a vote over spectral shape, not absolute level. A
+wideband LNA stick is loud everywhere and wins any absolute comparison, so each
+feature compares a role band with a reference band on the same device:
+
+| role | band | references |
+|---|---|---|
+| ais | 156-163 MHz | 88-108 (FM), 60-80, 200-300 MHz |
+| adsb | 1088-1092 MHz | 1000-1050, 1200-1300, 156-163 MHz |
+
+Every feature is measured at gains 10, 30 and 45, giving 18 votes. A vote counts
+only when one device beats the next by `--vote-margin-db` (6 dB); weaker ones
+abstain. The selection is decisive with at least `--min-votes` (3) counted
+votes, no role voted onto two devices and no device claimed by two roles;
+otherwise it fails (or, with `--learn`, falls back). Override the feature set
+with a JSON config `features` list of `{role, band, reference}`.
 
 The PiAware profile also runs with `--learn`: a decisive mapping is remembered
 by USB serial in `/var/lib/rtl-antenna-picker/roles-by-serial.json`, and an
