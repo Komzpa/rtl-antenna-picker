@@ -599,6 +599,48 @@ def select_from_memory(
     return replace(selection, assignment_strategy="memory")
 
 
+def select_degraded(
+    roles: Sequence[RoleSpec],
+    memory: dict,
+    serials: dict[int, str],
+    device_indexes: Sequence[int],
+    priority_role: str,
+    score_stat: str = "median",
+) -> Selection:
+    """Give the devices that are present the roles remembered for their serials.
+
+    With fewer dongles than roles nothing can be compared, so a known serial
+    keeps its remembered role and any unknown device takes the highest-priority
+    free role. Roles without a device stay unassigned instead of failing the
+    whole host.
+    """
+    pins = memory.get("roles") if isinstance(memory.get("roles"), dict) else {}
+    role_names = [role.name for role in roles]
+    priority_role = normalize_role_name(priority_role)
+    if priority_role in role_names:
+        role_names.remove(priority_role)
+        role_names.insert(0, priority_role)
+    assignments: dict[str, int] = {}
+    for index in device_indexes:
+        remembered = [role for role, serial in pins.items() if serial == serials.get(index) and role in role_names]
+        if len(remembered) == 1 and remembered[0] not in assignments:
+            assignments[remembered[0]] = index
+    for index in device_indexes:
+        if index in assignments.values():
+            continue
+        free = [role for role in role_names if role not in assignments]
+        if free:
+            assignments[free[0]] = index
+    return Selection(
+        assignments=assignments,
+        role_deltas_db={role: math.inf for role in assignments},
+        metrics=[],
+        roles=list(roles),
+        score_stat=score_stat,
+        assignment_strategy="degraded",
+    )
+
+
 def measurement_key(band: str, gain: str) -> str:
     return f"{band}@{gain}"
 
@@ -754,7 +796,12 @@ def shell_env_lines(selection: Selection, timestamp: str) -> list[str]:
         f"RTL_ANTENNA_PICKER_ROLES={shlex.quote(' '.join(role_names))}",
     ]
 
+    missing = [role.name for role in selection.roles if role.name not in selection.assignments]
+    if missing:
+        lines.append(f"RTL_ANTENNA_PICKER_MISSING_ROLES={shlex.quote(' '.join(missing))}")
     for role in selection.roles:
+        if role.name not in selection.assignments:
+            continue
         env_role = role_env_name(role.name)
         lines.append(f"{env_role}_RTL_INDEX={selection.assignments[role.name]}")
         delta = selection.role_deltas_db[role.name]
@@ -806,6 +853,7 @@ def selection_payload(selection: Selection, timestamp: str, runtime: RuntimeConf
             f"{selection.score_stat}_delta_db": selection.role_deltas_db[role.name],
         }
         for role in selection.roles
+        if role.name in selection.assignments
     }
     selected: dict[str, object] = {
         "roles": selected_roles,
@@ -1034,6 +1082,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RuntimeError(f"need at least one RTL device, found {device_count}")
         device_indexes = list(range(device_count))
 
+    if len(device_indexes) < len(runtime.roles) and args.learn:
+        selection = select_degraded(runtime.roles, memory, serials, device_indexes, args.piaware_role, runtime.score_stat)
+        missing = [role.name for role in runtime.roles if role.name not in selection.assignments]
+        print(f"rtl-antenna-picker: only {len(device_indexes)} RTL device(s); not starting {', '.join(missing)}", file=sys.stderr)
+        return emit_selection(args, runtime, selection, timestamp)
     if len(device_indexes) < len(runtime.roles):
         raise RuntimeError(f"need at least {len(runtime.roles)} RTL devices for roles {', '.join(role.name for role in runtime.roles)}")
 
@@ -1116,13 +1169,14 @@ def emit_selection(args: argparse.Namespace, runtime: RuntimeConfig, selection: 
     write_text_atomic(args.output_env, env_text)
     write_text_atomic(args.state_dir / "latest.json", json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
-    if args.apply_piaware:
+    if args.apply_piaware and normalize_role_name(args.piaware_role) in selection.assignments:
         apply_piaware_index(args.piaware_config, args.piaware_role, selection)
 
-    assignments = ", ".join(f"{role.name} RTL index {selection.assignments[role.name]}" for role in runtime.roles)
+    assigned = [role for role in runtime.roles if role.name in selection.assignments]
+    assignments = ", ".join(f"{role.name} RTL index {selection.assignments[role.name]}" for role in assigned)
     deltas = ", ".join(
         f"{role.name} {runtime.score_stat} delta {selection.role_deltas_db[role.name]:.1f} dB"
-        for role in runtime.roles
+        for role in assigned
         if not math.isinf(selection.role_deltas_db[role.name])
     )
     print(f"selected {assignments}; {deltas}", file=sys.stderr)

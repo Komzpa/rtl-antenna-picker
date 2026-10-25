@@ -8,6 +8,8 @@ After=rtl-antenna-picker.service dump1090-fa.service network.target
 [Service]
 Type=simple
 EnvironmentFile=/run/rtl-antenna-picker.env
+# No AIS dongle present (picker degraded mode): skip instead of a restart loop.
+ExecCondition=/bin/sh -c 'grep -q "^AIS_RTL_INDEX=" /run/rtl-antenna-picker.env'
 ExecStart=/bin/sh -eu -c 'exec /usr/bin/rtl_tcp -d "$${AIS_RTL_INDEX:?missing AIS_RTL_INDEX}" -a 0.0.0.0 -p 10101'
 Restart=always
 RestartSec=5

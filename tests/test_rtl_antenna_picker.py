@@ -1,4 +1,5 @@
 import argparse
+import json
 
 import pytest
 
@@ -402,3 +403,39 @@ def test_main_learn_ambiguous_first_boot_uses_best_guess(tmp_path, monkeypatch):
 
     assert "AIS_RTL_INDEX=" in env
     assert not (tmp_path / "state" / rtl_antenna_picker.MEMORY_FILE).exists()
+
+
+def _run_single(tmp_path, monkeypatch, serial, memory=None):
+    rtl_test_output = f"Found 1 device(s):\n  0:  Realtek, RTL2838UHIDIR, SN: {serial}\n"
+    monkeypatch.setattr(rtl_antenna_picker, "run_rtl_test", lambda *_: rtl_test_output)
+    def no_scan(**_):
+        raise AssertionError("a single device has nothing to compare")
+    monkeypatch.setattr(rtl_antenna_picker, "collect_vote_metrics", no_scan)
+    state = tmp_path / "state"
+    if memory is not None:
+        state.mkdir(parents=True, exist_ok=True)
+        (state / rtl_antenna_picker.MEMORY_FILE).write_text(json.dumps({"roles": memory}))
+    argv = ["--output-env", str(tmp_path / "picker.env"), "--state-dir", str(state), "--learn"]
+    assert rtl_antenna_picker.main(argv) == 0
+    return (tmp_path / "picker.env").read_text()
+
+
+def test_single_device_keeps_its_remembered_role(tmp_path, monkeypatch):
+    env = _run_single(tmp_path, monkeypatch, "77771111153705700", {"adsb": "00000001", "ais": "77771111153705700"})
+    assert "AIS_RTL_INDEX=0" in env
+    assert "ADSB_RTL_INDEX" not in env
+    assert "RTL_ANTENNA_PICKER_MISSING_ROLES=adsb" in env
+
+
+def test_single_unknown_device_takes_piaware_role(tmp_path, monkeypatch):
+    env = _run_single(tmp_path, monkeypatch, "12345678")
+    assert "ADSB_RTL_INDEX=0" in env
+    assert "AIS_RTL_INDEX" not in env
+    assert "RTL_ANTENNA_PICKER_ASSIGNMENT_STRATEGY=degraded" in env
+
+
+def test_single_device_without_learn_still_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(rtl_antenna_picker, "detect_device_count", lambda *_: 1)
+    argv = ["--output-env", str(tmp_path / "picker.env"), "--state-dir", str(tmp_path / "state")]
+    with pytest.raises(RuntimeError, match="need at least 2"):
+        rtl_antenna_picker.main(argv)

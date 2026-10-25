@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- With `--learn` and fewer dongles than roles, start the roles that have a dongle instead of failing the host: a known serial keeps its remembered role, an unknown one takes the `--piaware-role`. `RTL_ANTENNA_PICKER_MISSING_ROLES` lists the rest, and `ais-rtl-tcp` skips via `ExecCondition` when no AIS dongle is assigned.
 - New default `--assignment-strategy votes`: six spectral-shape features
   (AIS band vs FM, low VHF and UHF; 1090 MHz vs its neighbours and vs VHF),
   each measured on the same device so dongle gain and LNA noise cancel, at
